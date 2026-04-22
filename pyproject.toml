@@ -1,11 +1,18 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=69", "setuptools-scm[toml]>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mafutils"
-version = "0.1.0"
-description = "Reusable MAF toolkit for indexing, fetching, and summarizing MAFs."
+dynamic = ["version"]
+description = "Utilities for indexing, fetching, and summarizing MAFs."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Gregg Thomas" }
+]
+keywords = ["maf", "comparative-genomics", "bioinformatics"]
+urls = { Homepage = "https://informatics.fas.harvard.edu/", Repository = "https://github.com/harvardinformatics/mafutils", Issues = "https://github.com/harvardinformatics/mafutils/issues" }
 requires-python = ">=3.9"
 dependencies = [
   "typer",
@@ -16,3 +23,10 @@ mafutils = "mafutils.cli:main"
 
 [tool.setuptools]
 packages = ["mafutils", "mafutils.lib"]
+
+[tool.setuptools_scm]
+tag_regex = "^v(?P<version>\\d+\\.\\d+\\.\\d+)$"
+version_scheme = "no-guess-dev"
+local_scheme = "no-local-version"
+write_to = "mafutils/_version.py"
+fallback_version = "0.0.0"

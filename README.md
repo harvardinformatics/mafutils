@@ -9,6 +9,10 @@ It currently provides three commands:
 - `mafutils fetch`
 - `mafutils stats`
 
+## Disclaimer
+
+This project was developed with significant assistance from a large language model (GPT-5 / Codex).
+
 ## Installation
 
 From this `mafutils/` directory:
