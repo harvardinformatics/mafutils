@@ -347,13 +347,45 @@ def speciesFromSrc(src):
 
 #############################################################################
 
-def appendWarning(warning_state, message):
+WARNING_LABELS = {
+    "missing-scaffold": "missing-scaffold",
+    "multiple-strands": "multiple-strands",
+    "no-overlap": "no-overlap",
+    "trim-mismatch": "trim-mismatch",
+}
+
+
+def appendWarning(warning_state, code, message):
     if warning_state is None:
         return
 
     warning_state["count"] += 1
+    warning_state["counts"][code] = warning_state["counts"].get(code, 0) + 1
     if warning_state["messages"] is not None:
         warning_state["messages"].append(message)
+
+
+def formatWarningCounts(warning_counts):
+    if not warning_counts:
+        return "none"
+
+    ordered_codes = [
+        "no-overlap",
+        "missing-scaffold",
+        "trim-mismatch",
+        "multiple-strands",
+    ]
+    summary_parts = []
+
+    for code in ordered_codes:
+        if code in warning_counts:
+            summary_parts.append(f"{WARNING_LABELS[code]}={warning_counts[code]}")
+
+    for code in sorted(warning_counts):
+        if code not in WARNING_LABELS or code not in ordered_codes:
+            summary_parts.append(f"{code}={warning_counts[code]}")
+
+    return ", ".join(summary_parts)
 
 
 def getFillString(fill_cache, fill_char, block_len):
@@ -471,6 +503,7 @@ def writeFASTA(fasta_seqs, region, fasta_stream, BATCHLOG, fasta_header=False, v
                 region_strand = "."
                 appendWarning(
                     warning_state,
+                    "multiple-strands",
                     f"Multiple strands found for species {sp} in region {region['scaffold']}:{region['start']}-{region['end']}. Using '.' in header.",
                 )
 
@@ -562,6 +595,7 @@ def trimMafBlock(block_text, bed_start, bed_end, BATCHLOG, verbose=False, warnin
                 if extracted_ref_bases != expected_bases:
                     appendWarning(
                         warning_state,
+                        "trim-mismatch",
                         f"Expected {expected_bases} bases but extracted {extracted_ref_bases} for region {overlap_start}-{overlap_end}",
                     )
 
@@ -660,7 +694,11 @@ def fetchByRegion(
     blocks_written = 0;
 
     if scaffold not in index:
-        appendWarning(warning_state, f"{scaffold}:{bed_start}-{bed_end} No index entries for scaffold.")
+        appendWarning(
+            warning_state,
+            "missing-scaffold",
+            f"{scaffold}:{bed_start}-{bed_end} No index entries for scaffold.",
+        )
         summary = f"{region_str}\t0\t0\tNA\t0"
         return summary if not single_output else []
 
@@ -811,7 +849,11 @@ def fetchByRegion(
             addProfile(profile_state, "time_write_fasta", time.perf_counter() - write_timer_start)
 
     if not blocks_written:
-        appendWarning(warning_state, f"{scaffold}:{bed_start}-{bed_end} No overlapping blocks found.")
+        appendWarning(
+            warning_state,
+            "no-overlap",
+            f"{scaffold}:{bed_start}-{bed_end} No overlapping blocks found.",
+        )
 
     if not single_output:
         if out_stream is not None:
@@ -862,9 +904,9 @@ def fetchByBatch(
 
     batch_results = [None] * len(batch)
     region_num = 0
-    zero_overlap_regions = 0
-    success_regions = 0
-    warning_state = {"count": 0, "messages": [] if WORKER_VERBOSE else None}
+    no_output_regions = 0
+    written_regions = 0
+    warning_state = {"count": 0, "counts": {}, "messages": [] if WORKER_VERBOSE else None}
     profile_state = initProfileState() if WORKER_PROFILE else None
     batch_timer_start = time.perf_counter() if WORKER_PROFILE else None
 
@@ -902,12 +944,12 @@ def fetchByBatch(
         batch_results[result_idx] = region_result
         if not WORKER_SINGLE_OUTPUT:
             fields = region_result.split("\t")
-            if len(fields) >= 5:
+            if len(fields) >= 2:
                 try:
-                    if int(fields[4]) == 0:
-                        zero_overlap_regions += 1
+                    if int(fields[1]) == 0:
+                        no_output_regions += 1
                     else:
-                        success_regions += 1
+                        written_regions += 1
                 except ValueError:
                     pass
     if profile_state is not None:
@@ -916,10 +958,12 @@ def fetchByBatch(
     return {
         "results": batch_results,
         "processed_regions": len(batch_results),
-        "zero_overlap_regions": zero_overlap_regions,
+        "zero_overlap_regions": no_output_regions,
+        "no_output_regions": no_output_regions,
         "batch_num": batch_num,
-        "success_regions": success_regions,
+        "written_regions": written_regions,
         "warning_count": warning_state["count"],
+        "warning_counts": warning_state["counts"],
         "warning_messages": warning_state["messages"],
         "profile": profile_state,
     }
@@ -1158,26 +1202,23 @@ def run_fetch(args, cmdline="mafutils fetch"):
                     total_regions_reported += result["processed_regions"]
                     zero_overlap_regions += result["zero_overlap_regions"]
 
-                    if result["warning_count"] > 0:
-                        if args.verbose:
-                            for warning_message in result["warning_messages"]:
-                                LOG.warning(warning_message)
-                        else:
-                            LOG.warning(
-                                "Batch %d produced %d warning%s.",
-                                result["batch_num"],
-                                result["warning_count"],
-                                "" if result["warning_count"] == 1 else "s",
-                            )
+                    if result["warning_count"] > 0 and args.verbose:
+                        for warning_message in result["warning_messages"]:
+                            LOG.warning(warning_message)
 
                     zero_overlap_fraction_final_floor = zero_overlap_regions / num_regions if num_regions else 0.0
 
-                    LOG.info(
-                        "Completed batch %d: %d successful / %d warn / %d total",
+                    summary_log = LOG.warning if (
+                        result["warning_count"] > 0 or result["no_output_regions"] > 0
+                    ) else LOG.info
+
+                    summary_log(
+                        "Completed batch %d: %d total / %d written / %d no-output / warnings: %s",
                         result["batch_num"],
-                        result["success_regions"],
-                        result["zero_overlap_regions"],
                         result["processed_regions"],
+                        result["written_regions"],
+                        result["no_output_regions"],
+                        formatWarningCounts(result["warning_counts"]),
                     )
 
                     if zero_overlap_regions > MAX_NO_OVERLAP_REGIONS_DEFAULT:
