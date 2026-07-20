@@ -2,3 +2,11 @@ __pycache__
 mafutils/__pycache__
 mafutils/_version.py
 mafutils.egg-info/
+
+# Real production test data -- too large for git, never to be committed.
+data/
+
+# Regenerable benchmark pipeline output.
+benchmarks/results/
+benchmarks/summary.html
+benchmarks/.snakemake/

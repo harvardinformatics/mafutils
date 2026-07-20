@@ -1,4 +1,4 @@
-# mafutils-index format=2 maf=example-tabs.maf compression=none size=777 mtime=1784145266.0 hash=md5:790612b936fb9a12ec1308268831db18
+# mafutils-index format=2 maf=example.maf.gz compression=gz size=285 mtime=1784217118.0 hash=md5:67c22c97e78236b47ffeaf023f7a047b
 chr1	0	10	10	35	2	16	101
 chr1	18	8	8	33	2	101	182
 chr1	32	8	8	33	2	182	263
@@ -8,4 +8,4 @@ chr3	6	4	4	28	2	411	482
 chr4	0	5	5	29	2	482	557
 chr4	6	4	4	28	2	557	628
 chrX	50	4	4	28	2	628	700
-chr4	30	5	7	32	2	700	777
+chr4	30	5	7	32	2	700	776

@@ -4,7 +4,7 @@
 
 - This directory contains development of a program to interact with MAF (Multiple Alignment Format) files in the context of comparative genomics.
 - The current project directory is `/n/holylfs05/LABS/informatics/Lab/projects/gwct/dev/mafutils/`, referred to as `<project directory>` in this file.
-- The current project conda environment is `phyloacc-workflows`, referred to as `<project env>` in this file.
+- The current project conda environment is `mafutils-dev`, referred to as `<project env>` in this file.
 - For commands that require the R programming language, use the conda environment `<renv>`, but follow all the same rules and guardrails outlined throughout.
 
 ## Project directory guardrails

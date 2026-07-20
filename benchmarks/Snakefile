@@ -1,0 +1,466 @@
+#############################################################################
+# Benchmark mafutils (index/validate/gc/stats/fetch) across compression
+# types and process counts, against gwct's real ~42GB production data.
+#
+# Run from inside this directory:
+#     cd benchmarks && snakemake --cores 8
+# or, via SLURM:
+#     cd benchmarks && snakemake --workflow-profile profiles/slurm
+#
+# See README.md for the design decisions (why `index` writes to a throwaway
+# path, why gz has no process sweep, why fetch writes real multi-file
+# output, why history.csv is appended-to rather than regenerated, etc).
+#############################################################################
+
+import os
+
+configfile: "config.yaml"
+
+COMPRESSIONS = list(config["compressions"].keys())
+PARALLEL_COMPRESSIONS = config["parallel_compressions"]
+PROCESS_SWEEP = config["process_sweep"]
+HEADLINE_P = config["headline_processes"]
+SWEEP_BED_N = config["fetch_sweep_regions"]
+
+wildcard_constraints:
+    compression = "|".join(COMPRESSIONS),
+    processes = r"\d+",
+
+
+def maf_path(wildcards):
+    return config["compressions"][wildcards.compression]["maf"]
+
+
+def index_path(wildcards):
+    return config["compressions"][wildcards.compression]["block_index"]
+
+
+#############################################################################
+# Per-compression file-read locks: a named resource per compression, capped
+# at 1 globally (see profiles/slurm/config.yaml's `resources:` / the
+# --resources flag for local runs), so at most one job reads a given MAF at
+# a time -- concurrent readers of the SAME file were inflating times ~7-18%
+# vs baseline-manual-timings.txt's solo runs. Jobs touching DIFFERENT
+# compressions still run fully concurrently with each other; only same-file
+# access is serialized. Every rule below that reads a MAF spreads **IO_LOCKS
+# into its resources: block so it declares 1 unit of its own compression's
+# lock and (implicitly) 0 of the others.
+#############################################################################
+
+IO_LOCKS = {
+    f"io_{c}": (lambda wildcards, c=c: 1 if wildcards.compression == c else 0)
+    for c in COMPRESSIONS
+}
+
+#############################################################################
+# Global heavy-I/O cap: on top of the per-compression locks above, every
+# rule that reads a full multi-GB MAF also declares 1 unit of io_heavy,
+# capped globally (config.yaml: io_heavy_concurrency; see
+# profiles/slurm/config.yaml's top-level `resources:`, or --resources
+# io_heavy=N for local runs). io_locks alone only stop two jobs reading the
+# SAME file at once -- this additionally stops too many DIFFERENT files'
+# heavy reads from saturating the same underlying shared storage together.
+#############################################################################
+
+IO_HEAVY = {"io_heavy": 1}
+
+
+BENCHMARK_TSVS = (
+    expand("results/{c}/index.benchmark.tsv", c=COMPRESSIONS)
+    + expand("results/{c}/validate.benchmark.tsv", c=COMPRESSIONS)
+    + expand("results/{c}/gc.headline.benchmark.tsv", c=COMPRESSIONS)
+    + expand("results/{c}/stats.headline.benchmark.tsv", c=COMPRESSIONS)
+    + expand("results/{c}/fetch.headline.benchmark.tsv", c=COMPRESSIONS)
+    + expand("results/{c}/gc.sweep.p{p}.benchmark.tsv", c=PARALLEL_COMPRESSIONS, p=PROCESS_SWEEP)
+    + expand("results/{c}/stats.sweep.p{p}.benchmark.tsv", c=PARALLEL_COMPRESSIONS, p=PROCESS_SWEEP)
+    + expand("results/{c}/fetch.sweep.p{p}.benchmark.tsv", c=PARALLEL_COMPRESSIONS, p=PROCESS_SWEEP)
+    + ["results/gz/fetch.sweep.benchmark.tsv"]
+)
+
+
+rule all:
+    input:
+        BENCHMARK_TSVS,
+        "summary.html",
+
+
+#############################################################################
+# A small subset of the real BED file, used only for fetch's process-count
+# sweep (see README: the full ~979k-region BED would make the sweep matrix
+# far too slow, especially at --processes 1).
+#############################################################################
+
+rule sweep_bed:
+    input:
+        config["bed_file"],
+    output:
+        "results/sweep.bed",
+    threads: 1
+    resources:
+        mem_mb=2000,
+        runtime=10,
+    shell:
+        # A reproducible (fixed seed) uniform random sample, not the first N
+        # lines of the file -- the BED is scaffold-ordered, so the first N
+        # lines alone would under-represent the genome's real diversity of
+        # scaffolds/region sizes and could skew sweep timings relative to
+        # the full-BED headline run.
+        #
+        # Truncation is done with a final `awk 'NR<=n'`, not `head -n`:
+        # Snakemake's shell prelude sets `pipefail`, and `head` truncating a
+        # pipe sends SIGPIPE to whatever's still writing upstream (`cut`
+        # here) the moment it closes its stdin after reading enough lines --
+        # under `pipefail` that SIGPIPE (exit 141) fails the whole command,
+        # even though it's normal, harmless pipe-closing behavior. `awk
+        # 'NR<=n'` reads its entire input to real EOF (it just stops
+        # *printing* past line n, never exits early), so nothing upstream
+        # ever gets SIGPIPE'd. Confirmed empirically: the `head` version
+        # reproduces exit 141 under `set -euo pipefail` against the real
+        # BED file; this version exits 0 with identical output.
+        "awk -v seed=42 'BEGIN{{srand(seed)}} {{printf \"%.10f\\t%s\\n\", rand(), $0}}' {input} "
+        "| sort -k1,1g | cut -f2- | awk -v n={SWEEP_BED_N} 'NR<=n' > {output}"
+
+
+#############################################################################
+# index -- benchmarked in isolation, writing to a throwaway path. The real
+# indexes living next to each MAF in data/hamsters/ are gwct's own
+# already-verified production indexes (see baseline-manual-timings.txt) and
+# must never be rebuilt/overwritten by this pipeline.
+#############################################################################
+
+rule index:
+    input:
+        maf=maf_path,
+    output:
+        block=temp("results/{compression}/rebuilt.block.idx"),
+        scaffold=temp("results/{compression}/rebuilt.scaffold.idx"),
+    benchmark:
+        "results/{compression}/index.benchmark.tsv"
+    threads: 1
+    resources:
+        **IO_LOCKS,
+        **IO_HEAVY,
+        mem_mb=16000,
+        runtime=60,
+    shell:
+        "mafutils index {input.maf} {output.block} {output.scaffold}"
+
+
+#############################################################################
+# validate / gc / stats / fetch all reuse the EXISTING index next to each MAF
+# (input, read-only) rather than the one `index` rebuilds above -- rebuilding
+# per downstream command would multiply index's cost (minutes, for gz) across
+# every rule below for no benefit; these commands don't care which index
+# instance they're handed as long as it matches the MAF.
+#############################################################################
+
+rule validate:
+    input:
+        maf=maf_path,
+        index=index_path,
+    output:
+        touch("results/{compression}/validate.ok"),
+    benchmark:
+        "results/{compression}/validate.benchmark.tsv"
+    threads: 1
+    resources:
+        **IO_LOCKS,
+        **IO_HEAVY,
+        mem_mb=4000,
+        runtime=15,
+    shell:
+        "mafutils validate {input.maf} {input.index}"
+
+
+#############################################################################
+# gc
+#############################################################################
+
+rule gc_headline:
+    input:
+        maf=maf_path,
+        index=index_path,
+    output:
+        csv=temp("results/{compression}/gc.headline.gc.csv"),
+        mean=temp("results/{compression}/gc.headline.gc.mean.txt"),
+    benchmark:
+        "results/{compression}/gc.headline.benchmark.tsv"
+    threads: HEADLINE_P
+    resources:
+        **IO_LOCKS,
+        **IO_HEAVY,
+        # gz is forced sequential regardless of --processes (baseline: 1302s
+        # / ~22min) -- runtime=30 had no safety margin and timed out for real
+        # on a first SLURM run; none/bgzip finish in ~4min (observed), so
+        # this headroom costs nothing for them.
+        # mem_mb: real observed peak ~1.55GB (none/bgzip, parallel mode --
+        # gz's sequential-mode peak is a mere ~48MB, see DEVELOPMENT.md's
+        # note on gc's parallel/sequential memory cliff); ~4x margin here.
+        mem_mb=6000,
+        runtime=90,
+    params:
+        prefix=lambda w, output: output.csv[: -len(".gc.csv")],
+    shell:
+        "mafutils gc {input.maf} {input.index} -p {HEADLINE_P} -o {params.prefix}"
+
+
+rule gc_sweep:
+    input:
+        maf=maf_path,
+        index=index_path,
+    output:
+        csv=temp("results/{compression}/gc.sweep.p{processes}.gc.csv"),
+        mean=temp("results/{compression}/gc.sweep.p{processes}.gc.mean.txt"),
+    benchmark:
+        "results/{compression}/gc.sweep.p{processes}.benchmark.tsv"
+    wildcard_constraints:
+        compression="|".join(PARALLEL_COMPRESSIONS),
+    threads: lambda wildcards: int(wildcards.processes)
+    resources:
+        **IO_LOCKS,
+        **IO_HEAVY,
+        # See gc_headline: real observed peak ~1.55GB at p>=2 (parallel
+        # mode); p=1 (sequential mode, ~48MB) is far lower, covered by the
+        # same budget.
+        mem_mb=6000,
+        runtime=60,
+    params:
+        prefix=lambda w, output: output.csv[: -len(".gc.csv")],
+    shell:
+        "mafutils gc {input.maf} {input.index} -p {wildcards.processes} -o {params.prefix}"
+
+
+#############################################################################
+# stats -- sweep cells write the full block table, same as headline, varying
+# only --processes. Writing it is a real (largely non-parallelized) part of
+# what `stats` costs, so skipping it would benchmark a different, lighter
+# operation than what --processes actually sweeps over, and would hide the
+# Amdahl's-law-style flattening that fixed serial write cost should produce
+# as process count increases.
+#############################################################################
+
+rule stats_headline:
+    input:
+        maf=maf_path,
+        index=index_path,
+        species=config["species_file"],
+    output:
+        overall=temp("results/{compression}/stats.headline.overall.tsv"),
+        species_tsv=temp("results/{compression}/stats.headline.species.tsv"),
+        block=temp("results/{compression}/stats.headline.block.tsv"),
+        dashboard=temp("results/{compression}/stats.headline.dashboard.html"),
+    benchmark:
+        "results/{compression}/stats.headline.benchmark.tsv"
+    threads: HEADLINE_P
+    resources:
+        **IO_LOCKS,
+        **IO_HEAVY,
+        # Real observed peak ~5.8GB (gz); none/bgzip peak ~3.0GB. ~2x margin
+        # over the gz case.
+        mem_mb=12000,
+        runtime=180,
+    params:
+        prefix=lambda w, output: output.overall[: -len(".overall.tsv")],
+    shell:
+        "mafutils stats {input.maf} {input.index} -p {HEADLINE_P} -o {params.prefix} "
+        "--expected-species-file {input.species} --html-dashboard"
+
+
+rule stats_sweep:
+    input:
+        maf=maf_path,
+        index=index_path,
+    output:
+        overall=temp("results/{compression}/stats.sweep.p{processes}.overall.tsv"),
+        species_tsv=temp("results/{compression}/stats.sweep.p{processes}.species.tsv"),
+        block=temp("results/{compression}/stats.sweep.p{processes}.block.tsv"),
+    benchmark:
+        "results/{compression}/stats.sweep.p{processes}.benchmark.tsv"
+    wildcard_constraints:
+        compression="|".join(PARALLEL_COMPRESSIONS),
+    threads: lambda wildcards: int(wildcards.processes)
+    resources:
+        **IO_LOCKS,
+        **IO_HEAVY,
+        # Only none/bgzip (PARALLEL_COMPRESSIONS) run this -- observed peak
+        # ~3.0GB. Post the stats.py processes=1 pool-skip fix, p=1 should be
+        # considerably lower than that (was ~2.8GB pre-fix, matching the
+        # always-built pool this fix removes at p=1); this budget covers
+        # both the old and new p=1 behavior either way.
+        mem_mb=8000,
+        runtime=180,
+    params:
+        prefix=lambda w, output: output.overall[: -len(".overall.tsv")],
+    shell:
+        "mafutils stats {input.maf} {input.index} -p {wildcards.processes} -o {params.prefix}"
+
+
+#############################################################################
+# fetch -- writes real one-file-per-region output (mafutils fetch's default),
+# not --single-output, for both headline and sweep: --single-output is a
+# materially cheaper operation (one open handle, sequential writes) than the
+# default per-region open/close + directory-metadata path, so it would
+# benchmark a different, lighter operation than what fetch normally does.
+# Output directories are temp()-wrapped so Snakemake cleans them up once the
+# benchmark TSV/summary have been produced -- gwct's own manual runs already
+# produced this same one-file-per-region output once under data/hamsters/,
+# so this is a second, throwaway copy purely for timing.
+#############################################################################
+
+rule fetch_headline:
+    input:
+        maf=maf_path,
+        index=index_path,
+        bed=config["bed_file"],
+        species=config["species_file"],
+    output:
+        directory(temp("results/{compression}/fetch.headline.out")),
+    benchmark:
+        "results/{compression}/fetch.headline.benchmark.tsv"
+    threads: HEADLINE_P
+    resources:
+        **IO_LOCKS,
+        **IO_HEAVY,
+        # mem_mb=16000 OOM-killed on an earlier real run; a later run at
+        # mem_mb=65000 completed and reported real peaks: ~26.4GB (none/
+        # bgzip, 8 workers), 36.2GB (gz -- its decode-once cache holds
+        # everything in one process rather than spreading across workers,
+        # see DEVELOPMENT.md). ~1.3x margin over the gz peak.
+        mem_mb=48000,
+        runtime=240,
+    shell:
+        "mafutils fetch {input.maf} {input.bed} --index {input.index} -p {HEADLINE_P} "
+        "-b coords --fasta --fasta-dedupe most-seq --expected-species-file {input.species} "
+        "-o {output}"
+
+
+rule fetch_sweep:
+    input:
+        maf=maf_path,
+        index=index_path,
+        bed="results/sweep.bed",
+        species=config["species_file"],
+    output:
+        directory(temp("results/{compression}/fetch.sweep.p{processes}.out")),
+    benchmark:
+        "results/{compression}/fetch.sweep.p{processes}.benchmark.tsv"
+    wildcard_constraints:
+        compression="|".join(PARALLEL_COMPRESSIONS),
+    threads: lambda wildcards: int(wildcards.processes)
+    resources:
+        **IO_LOCKS,
+        **IO_HEAVY,
+        # Real observed peak ~11.5GB (5000-region subset, p=4/p=8 plateau
+        # around there); ~1.4x margin.
+        mem_mb=16000,
+        runtime=90,
+    shell:
+        "mafutils fetch {input.maf} {input.bed} --index {input.index} -p {wildcards.processes} "
+        "-b coords --fasta --fasta-dedupe most-seq --expected-species-file {input.species} "
+        "-o {output}"
+
+
+#############################################################################
+# A single gz reference point on the SAME 5000-region sweep BED as
+# fetch_sweep above (not the full headline BED) -- --processes is ignored
+# for gz regardless, matching gc_headline/stats_headline's precedent of one
+# gz data point standing in for the whole sweep. This exists specifically so
+# gz has a real, directly-comparable number at the sweep's workload size:
+# comparing gz's full-BED headline against none/bgzip's 5000-region sweep
+# (even normalized per-region) isn't apples-to-apples, since the smaller
+# sweep's per-region cost is dominated by fixed per-run overhead in a way
+# the full run isn't -- see notebook.ipynb and README.md.
+#############################################################################
+
+rule fetch_sweep_gz:
+    input:
+        maf=config["compressions"]["gz"]["maf"],
+        index=config["compressions"]["gz"]["block_index"],
+        bed="results/sweep.bed",
+        species=config["species_file"],
+    output:
+        directory(temp("results/gz/fetch.sweep.out")),
+    benchmark:
+        "results/gz/fetch.sweep.benchmark.tsv"
+    threads: 1
+    resources:
+        io_gz=1,
+        **IO_HEAVY,
+        # No real data yet for this cell specifically -- sized defensively
+        # from fetch_sweep's none/bgzip peak (~11.5GB) scaled up by roughly
+        # gz's headline-vs-none/bgzip-headline memory ratio (~1.4x, see
+        # DEVELOPMENT.md); tighten once a run reports its real max_rss.
+        mem_mb=20000,
+        runtime=60,
+    shell:
+        "mafutils fetch {input.maf} {input.bed} --index {input.index} -p 1 "
+        "-b coords --fasta --fasta-dedupe most-seq --expected-species-file {input.species} "
+        "-o {output}"
+
+
+#############################################################################
+# Append this run's headline + sweep numbers to history.csv, tagged with the
+# git commit and a timestamp, so performance can be tracked across code
+# changes over time -- unlike everything under results/, history.csv is NOT
+# gitignored/temp: it's meant to be committed and grow across real benchmark
+# runs. Deliberately append-only (not regenerate-from-scratch): each pipeline
+# run is a real measurement event worth keeping, including repeat runs at
+# the same commit (run-to-run variance is itself useful signal).
+#############################################################################
+
+rule record_history:
+    input:
+        benchmarks=BENCHMARK_TSVS,
+    output:
+        "history.csv",
+    threads: 1
+    resources:
+        mem_mb=2000,
+        runtime=10,
+    run:
+        import datetime
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, os.path.dirname(workflow.snakefile))
+        from parse_benchmarks import load_benchmarks
+
+        repo_root = Path(workflow.snakefile).resolve().parent.parent
+        commit = (
+            subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"], cwd=repo_root, capture_output=True, text=True
+            ).stdout.strip()
+            or "unknown"
+        )
+        if subprocess.run(["git", "diff", "--quiet"], cwd=repo_root).returncode != 0:
+            commit += "-dirty"
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+        bench = load_benchmarks("results", HEADLINE_P)
+        bench = bench[["compression", "command", "kind", "processes", "s", "max_rss", "mean_load"]].copy()
+        bench.insert(0, "git_commit", commit)
+        bench.insert(0, "run_timestamp", timestamp)
+
+        history_path = Path(str(output))
+        bench.to_csv(history_path, mode="a", header=not history_path.exists(), index=False)
+
+
+#############################################################################
+# Render the summary notebook fresh against whatever's in results/ and
+# history.csv.
+#############################################################################
+
+rule render_summary:
+    input:
+        notebook="notebook.ipynb",
+        benchmarks=BENCHMARK_TSVS,
+        history="history.csv",
+    output:
+        "summary.html",
+    threads: 1
+    resources:
+        mem_mb=4000,
+        runtime=15,
+    shell:
+        "jupyter nbconvert --to html --execute {input.notebook} --output-dir . --output summary.html"

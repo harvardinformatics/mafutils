@@ -1,0 +1,39 @@
+# Snakemake workflow profile for SLURM execution (Snakemake 8+ executor
+# plugin system). Requires: pip/conda install snakemake-executor-plugin-slurm
+#
+# Usage (from inside benchmarks/):
+#     snakemake --workflow-profile profiles/slurm
+#
+# FILL IN slurm_account/slurm_partition for your cluster before running --
+# these are placeholders and this pipeline can't guess them.
+
+executor: slurm
+jobs: 20            # max concurrent SLURM jobs submitted at once
+
+default-resources:
+  #slurm_account: "REPLACE_ME"
+  slurm_partition: "shared"
+
+# Global caps of 1 for each per-compression file-read lock (see IO_LOCKS in
+# the Snakefile) -- at most one job reads a given MAF at a time, so
+# concurrent readers of the SAME file can't inflate each other's measured
+# time. Jobs on DIFFERENT compressions are unaffected by this and still run
+# fully concurrently (up to `jobs:` above).
+#
+# io_heavy additionally caps how many heavy MAF-reading jobs run at once
+# ACROSS ALL compressions combined (see IO_HEAVY in the Snakefile /
+# io_heavy_concurrency in config.yaml, which these should be kept in sync
+# with) -- io_locks alone doesn't stop two DIFFERENT files' heavy reads from
+# contending for the same underlying shared storage, which a real run
+# showed happening (an `index` build and a sequential `gc` pass, on
+# different compressions, both ran slower while overlapping).
+resources:
+  io_none: 1
+  io_gz: 1
+  io_bgzip: 1
+  io_heavy: 2
+
+# Per-rule mem_mb/runtime/threads are set in the Snakefile. Several were
+# corrected from real SLURM run failures rather than guessed from
+# baseline-manual-timings.txt alone -- keep tightening them from the real
+# max_rss/s values in results/*.benchmark.tsv as more jobs complete.

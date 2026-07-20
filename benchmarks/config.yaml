@@ -1,0 +1,47 @@
+# Config for the mafutils benchmark Snakefile.
+# Paths are relative to this file's directory (run snakemake from inside
+# benchmarks/, e.g. `cd benchmarks && snakemake --cores 8`).
+
+# The same alignment, in three pre-existing compression variants. These are
+# gwct's real ~42GB production test data (see DEVELOPMENT.md) -- the pipeline
+# only ever reads maf/block_index here, it never rebuilds or overwrites them.
+compressions:
+  none:
+    maf: ../data/hamsters/uncompressed/cricetid-15spec.Mus_musculus.nodupes.maf
+    block_index: ../data/hamsters/uncompressed/cricetid-15spec.Mus_musculus.nodupes.maf.block.idx
+  gz:
+    maf: ../data/hamsters/gz/cricetid-15spec.Mus_musculus.nodupes.maf.gz
+    block_index: ../data/hamsters/gz/cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+  bgzip:
+    maf: ../data/hamsters/bgz/cricetid-15spec.Mus_musculus.nodupes.maf.gz
+    block_index: ../data/hamsters/bgz/cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+
+species_file: ../data/hamsters/species-names.txt
+bed_file: ../data/hamsters/combined-ucsc-peaks.merged-d5.min50.genbank.bed
+
+# Compressions whose --processes actually changes anything (gc/stats/fetch on
+# gz always fall back to a forced single sequential pass -- see
+# DEVELOPMENT.md -- so sweeping --processes for gz would just re-measure the
+# same sequential run N times). gz still gets one headline data point below.
+parallel_compressions: [none, bgzip]
+process_sweep: [1, 2, 4, 8]
+
+# Fixed --processes used for the single "headline" run of each command,
+# matching baseline-manual-timings.txt so the two are comparable.
+headline_processes: 8
+
+# fetch's process-count sweep uses a small subset of bed_file (rather than
+# the full ~979k regions) so the sweep matrix stays fast -- the full BED is
+# still used for the headline fetch run.
+fetch_sweep_regions: 5000
+
+# Global cap on concurrently-running "heavy" jobs (index/validate/gc/stats/
+# fetch -- anything that reads a full multi-GB MAF), on TOP OF the
+# per-compression io_locks. Those locks only stop two jobs reading the SAME
+# file at once; a real run showed two DIFFERENT files' heavy reads (an
+# `index` build and a sequential `gc` pass) still contending for the same
+# underlying shared Lustre bandwidth and both running slower as a result.
+# Lower this to 1 for maximally clean/isolated timings (at the cost of much
+# longer total wall-clock, since heavy jobs would then never overlap at
+# all); raise it if cross-file contention isn't a concern for your storage.
+io_heavy_concurrency: 2

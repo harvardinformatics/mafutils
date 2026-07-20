@@ -5,8 +5,11 @@
 # Refactored into mafutils package form, April 2026
 #############################################################################
 
-import gzip
-from typing import Annotated
+import hashlib
+import os
+import shutil
+import tempfile
+from typing import Annotated, Optional
 
 import typer
 
@@ -25,78 +28,69 @@ def process_maf_block(block):
 
 def run_index(maf_file, block_index_path, scaffold_index_path):
     maf_compression = COMMON.detectCompression(maf_file)
+    size = os.path.getsize(maf_file)
+    mtime = os.path.getmtime(maf_file)
+    hash_obj = hashlib.md5()
 
-    if maf_compression == "gz":
-        maf_stream = gzip.open(maf_file, "rt")
-    elif maf_compression == "none":
-        maf_stream = open(maf_file, "r")
-    else:
-        raise ValueError(f"Unsupported compression type: {maf_compression}")
+    out_dir = os.path.dirname(block_index_path) or "."
+    with tempfile.TemporaryDirectory(prefix="maf_index_tmp_", dir=out_dir) as tmp_dir:
+        block_tmp_path = os.path.join(tmp_dir, "block.idx")
+        scaffold_tmp_path = os.path.join(tmp_dir, "scaffold.idx")
 
-    with maf_stream, open(block_index_path, "w") as block_stream, open(scaffold_index_path, "w") as scaffold_stream:
-        line = "init"
-        block = []
+        # Rows are written to temp files first because the header (line 1 of
+        # each real output file) needs size/mtime/hash, and the hash isn't
+        # final until the whole file has been read via openMafHashing below.
+        with COMMON.openMafHashing(maf_file, maf_compression, hash_obj) as maf_stream, \
+                open(block_tmp_path, "w") as block_stream, \
+                open(scaffold_tmp_path, "w") as scaffold_stream:
 
-        current_scaffold = None
-        region_start_byte = None
-        region_end_byte = None
+            current_scaffold = None
+            region_start_byte = None
+            region_end_byte = None
 
-        while line != "":
-            line = maf_stream.readline()
-            if line.startswith("#") or line.strip() == "":
-                continue
+            for block_text, block_start, block_end in COMMON.iterMafBlocks(maf_stream):
+                block = block_text.split("\n")
+                block_info = process_maf_block(block)
+                ref_scaffold = block_info[0]
 
-            if line.startswith("a"):
-                header_line_len = len(line)
+                mdx_line = block_info + [str(block_start), str(block_end)]
+                block_stream.write("\t".join(mdx_line) + "\n")
 
-                if block:
-                    block_end = maf_stream.tell() - header_line_len
-                    block_info = process_maf_block(block)
-                    ref_scaffold = block_info[0]
-
-                    mdx_line = block_info + [str(block_start), str(block_end)]
-                    block_stream.write("\t".join(mdx_line) + "\n")
-
-                    if current_scaffold is None:
-                        current_scaffold = ref_scaffold
-                        region_start_byte = block_start
-                        region_end_byte = block_end
-                    elif ref_scaffold != current_scaffold:
-                        scaffold_stream.write(f"{current_scaffold}\t{region_start_byte}\t{region_end_byte}\n")
-                        current_scaffold = ref_scaffold
-                        region_start_byte = block_start
-                        region_end_byte = block_end
-                    else:
-                        region_end_byte = block_end
-
-                block_start = maf_stream.tell() - header_line_len
-                block = [line.strip()]
-            else:
-                block.append(line.strip())
-
-        if block:
-            block_end = maf_stream.tell()
-            block_info = process_maf_block(block)
-            ref_scaffold = block_info[0]
-
-            mdx_line = block_info + [str(block_start), str(block_end)]
-            block_stream.write("\t".join(mdx_line) + "\n")
-
-            if current_scaffold != ref_scaffold:
-                if current_scaffold is not None:
+                if current_scaffold is None:
+                    current_scaffold = ref_scaffold
+                    region_start_byte = block_start
+                    region_end_byte = block_end
+                elif ref_scaffold != current_scaffold:
                     scaffold_stream.write(f"{current_scaffold}\t{region_start_byte}\t{region_end_byte}\n")
-                current_scaffold = ref_scaffold
-                region_start_byte = block_start
-                region_end_byte = block_end
-            else:
-                region_end_byte = block_end
+                    current_scaffold = ref_scaffold
+                    region_start_byte = block_start
+                    region_end_byte = block_end
+                else:
+                    region_end_byte = block_end
 
-            scaffold_stream.write(f"{current_scaffold}\t{region_start_byte}\t{region_end_byte}\n")
+            if current_scaffold is not None:
+                scaffold_stream.write(f"{current_scaffold}\t{region_start_byte}\t{region_end_byte}\n")
+
+        content_hash = f"md5:{hash_obj.hexdigest()}"
+
+        with open(block_index_path, "w") as block_stream:
+            COMMON.writeIndexHeader(block_stream, maf_file, maf_compression, size, mtime, content_hash)
+            with open(block_tmp_path, "r") as tmp_fp:
+                shutil.copyfileobj(tmp_fp, block_stream)
+
+        with open(scaffold_index_path, "w") as scaffold_stream:
+            COMMON.writeIndexHeader(scaffold_stream, maf_file, maf_compression, size, mtime, content_hash)
+            with open(scaffold_tmp_path, "r") as tmp_fp:
+                shutil.copyfileobj(tmp_fp, scaffold_stream)
 
 
 def index_command(
-    maf_file: Annotated[str, typer.Argument(help="Input MAF file (.maf or .maf.gz)")],
-    block_index: Annotated[str, typer.Argument(help="Output block index path")],
-    scaffold_index: Annotated[str, typer.Argument(help="Output scaffold index path")],
+    maf_file: Annotated[str, typer.Argument(help="Input MAF file (.maf, .maf.gz, or bgzip-compressed .maf)")],
+    block_index: Annotated[Optional[str], typer.Argument(help="Output block index path (default: <MAF_FILE>.block.idx)")] = None,
+    scaffold_index: Annotated[Optional[str], typer.Argument(help="Output scaffold index path (default: <MAF_FILE>.scaffold.idx)")] = None,
 ) -> None:
+    if block_index is None:
+        block_index = COMMON.deriveBlockIndexPath(maf_file)
+    if scaffold_index is None:
+        scaffold_index = COMMON.deriveScaffoldIndexPath(maf_file)
     run_index(maf_file, block_index, scaffold_index)

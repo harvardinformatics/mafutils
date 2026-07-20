@@ -1,0 +1,7 @@
+# mafutils-index format=2 maf=example.maf.gz compression=gz size=285 mtime=1784217118.0 hash=md5:67c22c97e78236b47ffeaf023f7a047b
+chr1	16	263
+chr2	263	338
+chr3	338	482
+chr4	482	628
+chrX	628	700
+chr4	700	776

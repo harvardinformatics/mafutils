@@ -31,41 +31,45 @@ Parallelization:
     - The number of processes can be controlled with --processes
 
 Required input:
-    - A MAF file (.maf or .maf.gz)
-    - A MAF index file (from `mafutils index`)
+    - A MAF file (.maf, .maf.gz, or bgzip-compressed .maf)
+    - A MAF index file (from `mafutils index`; defaults to <MAF_FILE>.block.idx
+      or <MAF_FILE>.scaffold.idx if not given with --index)
     - A BED file
 
 Optional arguments:
+    --index, -i          Index file (default: derived from MAF_FILE)
     --outdir, -o         Output directory (default: current directory)
     --processes, -p      Number of parallel processes (default: 1)
     --mode, -m           Mode: 'block' or 'scaffold' (default: 'block')
 
 Compression:
-    - Gzipped MAF files (.maf.gz) are supported, provided the index is built
-    from the compressed file using gzip.open()
+    - Uncompressed and bgzip-compressed MAFs get real random access, so
+      --processes parallelizes normally.
+    - Plain gzip-compressed MAFs cannot be randomly seeked efficiently (each
+      seek can require re-decompressing everything before it), so fetch
+      falls back to a single sequential pass regardless of --processes.
 
 Usage:
-    python -m mafutils fetch <maf_file> <index_file> <bed_file> [--outdir DIR] [--processes N] [--mode block|scaffold]
+    python -m mafutils fetch <maf_file> <bed_file> [--index FILE] [--outdir DIR] [--processes N] [--mode block|scaffold]
 
 Examples:
     Block mode with 4 threads:
-        python -m mafutils fetch alignment.maf.gz index.idx regions.bed --processes 4
+        python -m mafutils fetch alignment.maf regions.bed --processes 4
 
     Scaffold mode with default output:
-        python -m mafutils fetch alignment.maf.gz index.idx scaffolds.bed --mode scaffold
+        python -m mafutils fetch alignment.maf scaffolds.bed --mode scaffold
 """
 
 import sys
 import os
 import re
 import atexit
-import gzip
 import logging
 import bisect
 import time
 from enum import Enum
 from types import SimpleNamespace
-from typing import Annotated
+from typing import Annotated, Optional
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from collections import defaultdict, OrderedDict
 
@@ -169,6 +173,7 @@ def initBatchWorker(
     fasta_dedupe,
     verbose,
     profile,
+    prefetched_cache=None,
 ):
     global WORKER_HEADER
     global WORKER_MAF_FILE
@@ -197,10 +202,15 @@ def initBatchWorker(
     WORKER_FASTA_DEDUPE = fasta_dedupe
     WORKER_VERBOSE = verbose
     WORKER_PROFILE = profile
-    WORKER_BLOCK_CACHE = OrderedDict()
 
-    opener = gzip.open if maf_compression == "gz" else open
-    WORKER_MAF_FP = opener(maf_file, "rb")
+    # For gzip input, prefetched_cache already holds every block needed across
+    # all regions, decoded in strictly-ascending file order (see
+    # prefetchBlockCache) -- inserting it directly here (bypassing
+    # getCachedBlockText's eviction check) means every later lookup is a
+    # guaranteed hit, so no backward seeks ever happen during real processing.
+    WORKER_BLOCK_CACHE = OrderedDict(prefetched_cache) if prefetched_cache else OrderedDict()
+
+    WORKER_MAF_FP = COMMON.openMaf(maf_file, maf_compression, "rb")
     atexit.register(closeBatchWorker)
 
 #############################################################################
@@ -320,13 +330,7 @@ def parseBed(bed_file, LOG, mode="block"):
 def getMAFHeader(maf_file, maf_compression):
     """Return header lines (starting with ##) from the MAF file, skipping blank lines."""
     headers = []
-    if maf_compression == "gz":
-        opener = gzip.open
-        mode = "rt"
-    else:
-        opener = open
-        mode = "rt"
-    with opener(maf_file, mode) as fp:
+    with COMMON.openMaf(maf_file, maf_compression, "rt") as fp:
         for line in fp:
             line = line.strip()
             if not line:  # Skip blank lines
@@ -396,18 +400,90 @@ def getFillString(fill_cache, fill_char, block_len):
 
 
 def getCachedBlockText(maf_fp, entry):
+    """
+    Returns the decoded text of one block, via WORKER_BLOCK_CACHE.
+
+    For compressed input (gz), the cache is pre-populated (see
+    prefetchBlockCache) in strictly-ascending file order before any region
+    is processed, so every lookup here is a guaranteed cache hit and the
+    eviction path below is never reached for those entries -- this is what
+    avoids backward seeks on gzip without needing per-worker parallel seeks.
+    For uncompressed/bgzip input the cache just opportunistically saves a
+    re-read/re-decode when multiple regions overlap the same block.
+    """
     cache_key = (entry["offset_start"], entry["offset_end"])
     if cache_key in WORKER_BLOCK_CACHE:
         WORKER_BLOCK_CACHE.move_to_end(cache_key)
         return WORKER_BLOCK_CACHE[cache_key]
 
-    maf_fp.seek(entry["offset_start"])
-    block_bytes = maf_fp.read(entry["offset_end"] - entry["offset_start"])
+    block_bytes = COMMON.readMafBlockBytes(maf_fp, WORKER_MAF_COMPRESSION, entry["offset_start"], entry["offset_end"])
     block_text = block_bytes.decode("utf-8", errors="replace")
     WORKER_BLOCK_CACHE[cache_key] = block_text
     if len(WORKER_BLOCK_CACHE) > WORKER_BLOCK_CACHE_MAX:
         WORKER_BLOCK_CACHE.popitem(last=False)
     return block_text
+
+
+def findOverlappingEntries(scaffold, bed_start, bed_end, index, profile_state=None):
+    """
+    Returns the list of index entries for `scaffold` that overlap
+    [bed_start, bed_end), in ascending ref_start order. Shared by real-time
+    lookup (fetchByRegion) and by prefetchBlockCache's upfront scan.
+    """
+    if scaffold not in index:
+        return None
+
+    scaffold_index = index[scaffold]
+    candidate_idx = bisect.bisect_left(scaffold_index["starts"], bed_start)
+    if candidate_idx > 0:
+        candidate_idx -= 1
+
+    overlapping = []
+    for entry in scaffold_index["entries"][candidate_idx:]:
+        if profile_state is not None:
+            profile_state["candidate_entries"] += 1
+        block_ref_start = entry["ref_start"]
+        block_ref_end = block_ref_start + entry["ref_length"]
+
+        if block_ref_end <= bed_start:
+            continue  # block before region
+        if block_ref_start >= bed_end:
+            break     # block after region
+
+        if bed_start < block_ref_end and bed_end > block_ref_start:
+            if profile_state is not None:
+                profile_state["overlap_blocks"] += 1
+            overlapping.append(entry)
+
+    return overlapping
+
+
+def prefetchBlockCache(regions, index, maf_file, maf_compression, LOG):
+    """
+    For plain-gzip input: collects every block entry needed across ALL
+    regions, reads each exactly once in strictly-ascending file order (never
+    seeking backward), and returns a dict keyed the same way as
+    WORKER_BLOCK_CACHE. Used to pre-seed that cache so fetchByRegion's
+    lookups are always hits during actual region processing.
+    """
+    needed = {}
+    for region in regions:
+        entries = findOverlappingEntries(region["scaffold"], region["start"], region["end"], index)
+        if not entries:
+            continue
+        for entry in entries:
+            needed[(entry["offset_start"], entry["offset_end"])] = entry
+
+    ordered_keys = sorted(needed.keys())
+    LOG.info(f"Prefetching {len(ordered_keys)} distinct block(s) needed across all regions (gzip input).")
+
+    cache = {}
+    with COMMON.openMaf(maf_file, maf_compression, "rb") as maf_fp:
+        for offset_start, offset_end in ordered_keys:
+            block_bytes = COMMON.readMafBlockBytes(maf_fp, maf_compression, offset_start, offset_end)
+            cache[(offset_start, offset_end)] = block_bytes.decode("utf-8", errors="replace")
+
+    return cache
 
 
 def initProfileState():
@@ -704,133 +780,114 @@ def fetchByRegion(
 
     blocks_written = 0
 
-    scaffold_index = index[scaffold]
-    candidate_idx = bisect.bisect_left(scaffold_index["starts"], bed_start)
-    if candidate_idx > 0:
-        candidate_idx -= 1
-
     scan_timer_start = time.perf_counter() if profile_state is not None else None
-    for entry in scaffold_index["entries"][candidate_idx:]:
+    overlapping_entries = findOverlappingEntries(scaffold, bed_start, bed_end, index, profile_state=profile_state)
+
+    for entry in overlapping_entries:
+        try:
+            read_timer_start = time.perf_counter() if profile_state is not None else None
+            block_text = getCachedBlockText(maf_fp, entry)
+            if profile_state is not None:
+                addProfile(profile_state, "time_read_decode", time.perf_counter() - read_timer_start)
+            #print(block_text.splitlines()[1])
+        except Exception as e:
+            BATCHLOG.error(f"Error fetching block: {e}")
+            raise
+
+        trim_timer_start = time.perf_counter() if profile_state is not None else None
+        trimmed_result = trimMafBlock(
+            block_text,
+            bed_start,
+            bed_end,
+            BATCHLOG,
+            verbose=verbose,
+            warning_state=warning_state,
+        )
         if profile_state is not None:
-            profile_state["candidate_entries"] += 1
-        block_ref_start = entry["ref_start"]
-        block_ref_end = block_ref_start + entry["ref_length"]
+            addProfile(profile_state, "time_trim", time.perf_counter() - trim_timer_start)
+        if trimmed_result is None:
+            continue
+        trimmed, trimmed_info = trimmed_result
 
-        if block_ref_end <= bed_start:
-            continue  # block before region
+        if not single_output and trimmed is not None:
+            block_stats.append(trimmed_info)
+            total_ref_bases += trimmed_info[2]
 
-        if block_ref_start >= bed_end:
-            break     # block after region
+            if blocks_written == 0 and not as_fasta:
+                out_stream = open(output_filename, "w", encoding="utf-8")
+                out_stream.write(header)
+                out_stream.write("## Extracted by mafutils fetch\n")
+                out_stream.write("## Source MAF: " + os.path.basename(WORKER_MAF_FILE or "") + "\n")
+                out_stream.write(f"## Reference region: {region_str}\n")
 
-        if bed_start < block_ref_end and bed_end > block_ref_start:
-            if profile_state is not None:
-                profile_state["overlap_blocks"] += 1
-            try:
-                read_timer_start = time.perf_counter() if profile_state is not None else None
-                maf_fp.seek(entry["offset_start"])
-                block_bytes = maf_fp.read(entry["offset_end"] - entry["offset_start"])
-                block_text = block_bytes.decode("utf-8", errors="replace")
+            if as_fasta:
+
+                # Output as fasta
+                fasta_block_timer_start = time.perf_counter() if profile_state is not None else None
+                return_fasta_seqs, block_len = mafBlockToFasta(
+                    trimmed,
+                    region,
+                    dedupe_mode=fasta_dedupe,
+                    use_species_keys=use_species_keys
+                )
                 if profile_state is not None:
-                    addProfile(profile_state, "time_read_decode", time.perf_counter() - read_timer_start)
-                #print(block_text.splitlines()[1])
-            except Exception as e:
-                BATCHLOG.error(f"Error fetching block: {e}")
-                raise
+                    addProfile(profile_state, "time_block_to_fasta", time.perf_counter() - fasta_block_timer_start)
+                #fasta_lines[src] = {'header': header, 'seq': seq, 'start': start, 'end': end, 'strand': strand}
+                block_lengths.append(block_len)
 
-            trim_timer_start = time.perf_counter() if profile_state is not None else None
-            trimmed_result = trimMafBlock(
-                block_text,
-                bed_start,
-                bed_end,
-                BATCHLOG,
-                verbose=verbose,
-                warning_state=warning_state,
-            )
-            if profile_state is not None:
-                addProfile(profile_state, "time_trim", time.perf_counter() - trim_timer_start)
-            if trimmed_result is None:
-                continue
-            trimmed, trimmed_info = trimmed_result
+                stitch_timer_start = time.perf_counter() if profile_state is not None else None
+                if expected_species:
+                    for sp in expected_species:
+                        if sp not in return_fasta_seqs:
+                            return_fasta_seqs[sp] = {
+                                'seq': getFillString(fill_cache, "N", block_len),
+                                'start': None,
+                                'end': None,
+                                'strand': None
+                            }
 
-            if not single_output and trimmed is not None:
-                block_stats.append(trimmed_info)
-                total_ref_bases += trimmed_info[2]                
+                # For any new species, add to order and backfill
+                for sp in return_fasta_seqs:
+                    if sp not in species_order:
+                        species_order.append(sp)
+                    if sp not in fasta_seqs:
+                        # Backfill for all previous blocks
+                        fasta_seqs[sp]['seq'] = [getFillString(fill_cache, "-", l) for l in block_lengths[:-1]]
+                        fasta_seqs[sp]['starts'] = []
+                        fasta_seqs[sp]['ends'] = []
+                        fasta_seqs[sp]['strands'] = []
 
-                if blocks_written == 0 and not as_fasta:
-                    out_stream = open(output_filename, "w", encoding="utf-8")
-                    out_stream.write(header)
-                    out_stream.write("## Extracted by mafutils fetch\n")
-                    out_stream.write("## Source MAF: " + os.path.basename(maf_fp.name) + "\n")
-                    out_stream.write(f"## Reference region: {region_str}\n")
-                    
-                if as_fasta:
-                    
-                    # Output as fasta
-                    fasta_block_timer_start = time.perf_counter() if profile_state is not None else None
-                    return_fasta_seqs, block_len = mafBlockToFasta(
-                        trimmed,
-                        region,
-                        dedupe_mode=fasta_dedupe,
-                        use_species_keys=use_species_keys
-                    )
-                    if profile_state is not None:
-                        addProfile(profile_state, "time_block_to_fasta", time.perf_counter() - fasta_block_timer_start)
-                    #fasta_lines[src] = {'header': header, 'seq': seq, 'start': start, 'end': end, 'strand': strand}
-                    block_lengths.append(block_len)
-
-                    stitch_timer_start = time.perf_counter() if profile_state is not None else None
-                    if expected_species:
-                        for sp in expected_species:
-                            if sp not in return_fasta_seqs:
-                                return_fasta_seqs[sp] = {
-                                    'seq': getFillString(fill_cache, "N", block_len),
-                                    'start': None,
-                                    'end': None,
-                                    'strand': None
-                                }
-
-                    # For any new species, add to order and backfill
-                    for sp in return_fasta_seqs:
-                        if sp not in species_order:
-                            species_order.append(sp)
-                        if sp not in fasta_seqs:
-                            # Backfill for all previous blocks
-                            fasta_seqs[sp]['seq'] = [getFillString(fill_cache, "-", l) for l in block_lengths[:-1]]
-                            fasta_seqs[sp]['starts'] = []
-                            fasta_seqs[sp]['ends'] = []
-                            fasta_seqs[sp]['strands'] = []
-
-                    # After establishing all species, append current block or pad as needed
-                    for sp in species_order:
-                        if sp in return_fasta_seqs:
-                            seq = return_fasta_seqs[sp]['seq']
-                        else:
-                            fill_char = "N" if sp in expected_species_set else "-"
-                            seq = getFillString(fill_cache, fill_char, block_len)
-                        fasta_seqs[sp]['seq'].append(seq)
-                        if sp in return_fasta_seqs:
-                            if return_fasta_seqs[sp]['start'] is not None:
-                                fasta_seqs[sp]['starts'].append(return_fasta_seqs[sp]['start'])
-                            if return_fasta_seqs[sp]['end'] is not None:
-                                fasta_seqs[sp]['ends'].append(return_fasta_seqs[sp]['end'])
-                            if return_fasta_seqs[sp]['strand'] is not None:
-                                fasta_seqs[sp]['strands'].append(return_fasta_seqs[sp]['strand'])
-                    if profile_state is not None:
-                        addProfile(profile_state, "time_fasta_stitch", time.perf_counter() - stitch_timer_start)
-                else:
-                    out_stream.write(trimmed + "\n")
-                blocks_written += 1
-            elif single_output and trimmed is not None:
-                if as_fasta:
-                    return_fasta_seqs, _ = mafBlockToFasta(
-                        trimmed,
-                        region,
-                        dedupe_mode=fasta_dedupe,
-                        use_species_keys=use_species_keys
-                    )
-                    current_blocks.append(return_fasta_seqs)
-                else:
-                    current_blocks.append(trimmed + "\n")
+                # After establishing all species, append current block or pad as needed
+                for sp in species_order:
+                    if sp in return_fasta_seqs:
+                        seq = return_fasta_seqs[sp]['seq']
+                    else:
+                        fill_char = "N" if sp in expected_species_set else "-"
+                        seq = getFillString(fill_cache, fill_char, block_len)
+                    fasta_seqs[sp]['seq'].append(seq)
+                    if sp in return_fasta_seqs:
+                        if return_fasta_seqs[sp]['start'] is not None:
+                            fasta_seqs[sp]['starts'].append(return_fasta_seqs[sp]['start'])
+                        if return_fasta_seqs[sp]['end'] is not None:
+                            fasta_seqs[sp]['ends'].append(return_fasta_seqs[sp]['end'])
+                        if return_fasta_seqs[sp]['strand'] is not None:
+                            fasta_seqs[sp]['strands'].append(return_fasta_seqs[sp]['strand'])
+                if profile_state is not None:
+                    addProfile(profile_state, "time_fasta_stitch", time.perf_counter() - stitch_timer_start)
+            else:
+                out_stream.write(trimmed + "\n")
+            blocks_written += 1
+        elif single_output and trimmed is not None:
+            if as_fasta:
+                return_fasta_seqs, _ = mafBlockToFasta(
+                    trimmed,
+                    region,
+                    dedupe_mode=fasta_dedupe,
+                    use_species_keys=use_species_keys
+                )
+                current_blocks.append(return_fasta_seqs)
+            else:
+                current_blocks.append(trimmed + "\n")
 
     if as_fasta and not single_output and blocks_written > 0:
         out_stream = open(output_filename, "w", encoding="utf-8")
@@ -978,20 +1035,40 @@ def fetchByScaffold(scaffold, start_end, maf_file, maf_header, maf_compression, 
     start, end = start_end
     output_path = os.path.join(out_dir, f"{scaffold}.maf")
 
-    # Open MAF file appropriately
-    opener = gzip.open if maf_compression == "gz" else open
-
     try:
-        with opener(maf_file, "rb") as mfp, open(output_path, "wb") as outfp:
+        with COMMON.openMaf(maf_file, maf_compression, "rb") as mfp, open(output_path, "wb") as outfp:
             LOG.info(f">>> Scaffold {scaffold}");
-            mfp.seek(start)
-            data = mfp.read(end - start)
+            data = COMMON.readMafBlockBytes(mfp, maf_compression, start, end)
             outfp.write(maf_header.encode("utf-8"))
             outfp.write(data)
     except Exception as e:
         LOG.error(f"{scaffold}: {e}")
-    
+
     return f"{output_path}: Wrote {scaffold}";
+
+
+def fetchScaffoldsSequential(ordered_scaffolds, index, maf_file, maf_header, maf_compression, out_dir, LOG):
+    """
+    Extracts multiple scaffolds using a single open MAF handle, in the given
+    (ascending file-offset) order. Used for gzip input: reusing one handle
+    and never seeking backward avoids the redundant-decompression cost that
+    reopening the file per scaffold (as fetchByScaffold does) would incur.
+    """
+    results = []
+    with COMMON.openMaf(maf_file, maf_compression, "rb") as mfp:
+        for scaffold in ordered_scaffolds:
+            start, end = index[scaffold]
+            output_path = os.path.join(out_dir, f"{scaffold}.maf")
+            try:
+                LOG.info(f">>> Scaffold {scaffold}");
+                data = COMMON.readMafBlockBytes(mfp, maf_compression, start, end)
+                with open(output_path, "wb") as outfp:
+                    outfp.write(maf_header.encode("utf-8"))
+                    outfp.write(data)
+            except Exception as e:
+                LOG.error(f"{scaffold}: {e}")
+            results.append(f"{output_path}: Wrote {scaffold}")
+    return results
 
 
 #############################################################################
@@ -1025,12 +1102,31 @@ def run_fetch(args, cmdline="mafutils fetch"):
     #     sys.exit(1)
 
     maf_compression = COMMON.detectCompression(args.maf_file);
+    if maf_compression not in ("none", "gz", "bgzip"):
+        LOG.error(f"Unsupported MAF compression: {maf_compression}")
+        sys.exit(1)
     if not args.single_output:
         os.makedirs(args.output, exist_ok=True);
     # Create output directory if it doesn't exist
 
-    LOG.info(f"Parsing index file.... {args.index_file}");
-    index = parseIndex(args.index_file, LOG, args.mode);
+    index_file = args.index_file
+    if index_file is None:
+        index_file = (
+            COMMON.deriveScaffoldIndexPath(args.maf_file)
+            if args.mode == "scaffold"
+            else COMMON.deriveBlockIndexPath(args.maf_file)
+        )
+        if not os.path.isfile(index_file):
+            LOG.error(
+                f"No index given and none found at default location ({index_file}). "
+                f"Run `mafutils index` first."
+            )
+            sys.exit(1)
+        LOG.info(f"Using index at default location: {index_file}")
+
+    LOG.info(f"Parsing index file.... {index_file}");
+    COMMON.validateIndexHeader(COMMON.readIndexHeader(index_file), args.maf_file, maf_compression, LOG, strict=args.verify_hash)
+    index = parseIndex(index_file, LOG, args.mode);
 
     LOG.info(f"Parsing BED file...... {args.bed_file}");
     regions = parseBed(args.bed_file, LOG, args.mode);
@@ -1062,32 +1158,47 @@ def run_fetch(args, cmdline="mafutils fetch"):
             sys.exit(1)
 
         LOG.info(f"Running in SCAFFOLD mode with BED + region index");
-        
+
         # Parse the BED file to get a set of scaffolds to extract
         scaffold_set = set(region["scaffold"] for region in regions);
+        for scaffold in scaffold_set:
+            if scaffold not in index:
+                LOG.error(f"Scaffold '{scaffold}' not found in index.")
+                sys.exit(1)
         LOG.info(f"Extracting {len(scaffold_set)} scaffolds from scaffold index: {scaffold_set}");
 
-        # Extract from MAF using the region index for matching scaffolds
-        with ProcessPoolExecutor(max_workers=args.processes) as executor:
-            futures = []
-            for scaffold in scaffold_set:
-                if scaffold not in index:
-                    LOG.error(f"Scaffold '{scaffold}' not found in index.")
-                    sys.exit(1)
-                start, end = index[scaffold]
-                futures.append(executor.submit(
-                    fetchByScaffold,
-                    scaffold,
-                    (start, end),
-                    args.maf_file,
-                    maf_header,
-                    maf_compression,
-                    args.output,
-                    LOG
-                ))
-            for future in futures:
-                result = future.result()
+        # Process scaffolds in ascending file-offset order; for gzip this is
+        # what lets a single reused handle avoid ever seeking backward.
+        ordered_scaffolds = sorted(scaffold_set, key=lambda s: index[s][0])
+
+        if maf_compression == "gz":
+            if args.processes > 1:
+                LOG.warning(
+                    "Parallel processing requires random access into the MAF, which is inefficient on "
+                    "gzip-compressed files; --processes will be ignored. (Use a bgzip-compressed MAF "
+                    "for real parallel speedup on compressed input.)"
+                )
+            for result in fetchScaffoldsSequential(ordered_scaffolds, index, args.maf_file, maf_header, maf_compression, args.output, LOG):
                 LOG.info(result)
+        else:
+            # Extract from MAF using the region index for matching scaffolds
+            with ProcessPoolExecutor(max_workers=args.processes) as executor:
+                futures = []
+                for scaffold in ordered_scaffolds:
+                    start, end = index[scaffold]
+                    futures.append(executor.submit(
+                        fetchByScaffold,
+                        scaffold,
+                        (start, end),
+                        args.maf_file,
+                        maf_header,
+                        maf_compression,
+                        args.output,
+                        LOG
+                    ))
+                for future in futures:
+                    result = future.result()
+                    LOG.info(result)
         return;  # Done with scaffold mode
 
     ##############################
@@ -1102,11 +1213,26 @@ def run_fetch(args, cmdline="mafutils fetch"):
         LOG.error("--fasta-dedupe requires --fasta.")
         sys.exit(1)
 
+    effective_processes = args.processes
+    prefetch_cache = None
+    if maf_compression == "gz":
+        if args.processes > 1:
+            LOG.warning(
+                "Parallel processing requires random access into the MAF, which is inefficient on "
+                "gzip-compressed files; --processes will be ignored. (Use a bgzip-compressed MAF "
+                "for real parallel speedup on compressed input.)"
+            )
+        effective_processes = 1
+        prefetch_cache = prefetchBlockCache(regions, index, args.maf_file, maf_compression, LOG)
+        # Every block any region needs is now decoded, in strictly-ascending
+        # file order, exactly once. initBatchWorker pre-seeds the worker's
+        # cache from this so fetchByRegion's lookups never seek at all.
+
     num_regions = len(regions);
-    batch_size = pick_chunk_size(num_regions, args.processes);
+    batch_size = pick_chunk_size(num_regions, effective_processes);
     if batch_size >= num_regions:
         batch_size = 1
-    LOG.info(f"Using batch size of {batch_size} regions for {num_regions} total regions with {args.processes} processes.");
+    LOG.info(f"Using batch size of {batch_size} regions for {num_regions} total regions with {effective_processes} processes.");
     batches = list(chunker(regions, size=batch_size))
     LOG.info(f"Divided {len(regions)} regions into {len(batches)} batches of up to {batch_size} regions each.");
     # Region batching for parallel processing
@@ -1157,7 +1283,7 @@ def run_fetch(args, cmdline="mafutils fetch"):
     profile_totals = initProfileState() if args.profile else None
     profiled_batches = 0
     with ProcessPoolExecutor(
-        max_workers=args.processes,
+        max_workers=effective_processes,
         initializer=initBatchWorker,
         initargs=(
             maf_header,
@@ -1172,6 +1298,7 @@ def run_fetch(args, cmdline="mafutils fetch"):
             args.fasta_dedupe,
             args.verbose,
             args.profile,
+            prefetch_cache,
         ),
     ) as executor, open(info_outfile, "w") as info_out:
         summary_headers = ["scaffold", "start", "end", "basename", "n.overlapping.blocks", "block.lengths", "interblock.distances", "n.sequences"]
@@ -1313,9 +1440,15 @@ def run_fetch(args, cmdline="mafutils fetch"):
 
 
 def fetch_command(
-    maf_file: Annotated[str, typer.Argument(help="Input MAF file (.maf or .maf.gz)")],
-    index_file: Annotated[str, typer.Argument(help="Index file (block-level .idx or scaffold-level .idx)")],
+    maf_file: Annotated[str, typer.Argument(help="Input MAF file (.maf, .maf.gz, or bgzip-compressed .maf)")],
     bed_file: Annotated[str, typer.Argument(help="BED file with regions or scaffold names to extract")],
+    index_file: Annotated[
+        Optional[str],
+        typer.Option(
+            "--index", "-i",
+            help="Index file (block-level or scaffold-level, matching --mode). Required -- if omitted, looked up at <MAF_FILE>.block.idx or <MAF_FILE>.scaffold.idx by default; errors if not found there.",
+        ),
+    ] = None,
     basename: Annotated[BasenameMode, typer.Option("--basename", "-b", help="Basename strategy: 'id' (BED 4th col if present), 'coords' (scaffold-start-end), or 'count' (numbered per scaffold)")] = BasenameMode.coords,
     output: Annotated[str, typer.Option("--output", "-o", help="Output directory (default: current directory); if --single-output is used, this should instead be a filename and will default to maf-fetch.maf in the current directory.")] = ".",
     fasta: Annotated[bool, typer.Option("--fasta", "-f", help="Output region(s) in FASTA format instead of MAF.")] = False,
@@ -1328,6 +1461,7 @@ def fetch_command(
     single_output: Annotated[bool, typer.Option("--single-output", hidden=True)] = False,
     verbose: Annotated[bool, typer.Option("--verbose", help="Print every warning line after each batch completes.")] = False,
     profile: Annotated[bool, typer.Option("--profile", help="Log aggregate timing breakdowns for internal fetch steps.")] = False,
+    verify_hash: Annotated[bool, typer.Option("--verify-hash", help="Verify the index's stored content hash against the MAF file (reads the whole file).")] = False,
 ) -> None:
     args = SimpleNamespace(
         maf_file=maf_file,
@@ -1345,6 +1479,7 @@ def fetch_command(
         single_output=single_output,
         verbose=verbose,
         profile=profile,
+        verify_hash=verify_hash,
     )
     cmdline = "mafutils fetch"
     if len(sys.argv) > 2:

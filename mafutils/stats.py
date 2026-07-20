@@ -24,7 +24,6 @@ Designed for speed:
 
 import base64
 import datetime
-import gzip
 import html
 import io
 import logging
@@ -34,7 +33,7 @@ import sys
 import tempfile
 from enum import Enum
 from types import SimpleNamespace
-from typing import Annotated
+from typing import Annotated, Optional
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
@@ -213,8 +212,6 @@ def workerTask(
     write_block_rows,
     tmp_dir,
 ):
-    opener = gzip.open if maf_compression == "gz" else open
-
     overall = {
         "total_blocks": 0,
         "total_alignment_columns": 0,
@@ -252,7 +249,7 @@ def workerTask(
         block_tmp_path = os.path.join(tmp_dir, f"maf_stats.blocks.task{task_id}.tsv")
         block_tmp = open(block_tmp_path, "w", encoding="utf-8")
 
-    with opener(maf_file, "rb") as maf_fp:
+    with COMMON.openMaf(maf_file, maf_compression, "rb") as maf_fp:
         for entry in entries:
             (
                 block_id,
@@ -265,8 +262,7 @@ def workerTask(
                 offset_end,
             ) = entry
 
-            maf_fp.seek(offset_start)
-            block_bytes = maf_fp.read(offset_end - offset_start)
+            block_bytes = COMMON.readMafBlockBytes(maf_fp, maf_compression, offset_start, offset_end)
             block_text = block_bytes.decode("utf-8", errors="replace")
             parsed = parseBlock(block_text)
 
@@ -1173,31 +1169,58 @@ def run_stats(args, cmdline="mafutils stats"):
         sys.exit(1)
 
     maf_compression = COMMON.detectCompression(args.maf_file)
-    if maf_compression not in ("none", "gz"):
+    if maf_compression not in ("none", "gz", "bgzip"):
         LOG.error(f"Unsupported MAF compression: {maf_compression}")
         sys.exit(1)
+
+    index_file = args.index_file
+    if index_file is None:
+        index_file = COMMON.deriveBlockIndexPath(args.maf_file)
+        if not os.path.isfile(index_file):
+            LOG.error(
+                f"No index file given and none found at default location ({index_file}). "
+                f"Run `mafutils index` first."
+            )
+            sys.exit(1)
+        LOG.info(f"Using index at default location: {index_file}")
 
     expected_species = parseExpectedSpecies(args)
     if expected_species:
         LOG.info(f"Loaded {len(expected_species)} expected species for exact missing-species reporting.")
 
-    LOG.info(f"Parsing index file: {args.index_file}")
-    entries = parseIndex(args.index_file, LOG)
+    LOG.info(f"Parsing index file: {index_file}")
+    COMMON.validateIndexHeader(COMMON.readIndexHeader(index_file), args.maf_file, maf_compression, LOG, strict=args.verify_hash)
+    entries = parseIndex(index_file, LOG)
     if not entries:
         LOG.error("No valid index entries found.")
         sys.exit(1)
     LOG.info(f"Loaded {len(entries)} indexed blocks.")
 
-    chunks = list(chunker(entries, args.chunk_size))
-    LOG.info(f"Running {len(chunks)} tasks with chunk size {args.chunk_size} across {args.processes} process(es).")
+    effective_processes = args.processes
+    effective_chunk_size = args.chunk_size
+    if maf_compression == "gz":
+        if args.processes > 1:
+            LOG.warning(
+                "Parallel processing requires random access into the MAF, which is inefficient on "
+                "gzip-compressed files; --processes will be ignored. (Use a bgzip-compressed MAF "
+                "for real parallel speedup on compressed input.)"
+            )
+        effective_processes = 1
+        effective_chunk_size = len(entries)
+        # A single task covering every entry, in one worker: since entries are
+        # already in ascending file order, this keeps gzip seeking strictly
+        # forward (cheap) instead of paying a redundant-decompression cost
+        # per additional worker/chunk.
+
+    chunks = list(chunker(entries, effective_chunk_size))
+    LOG.info(f"Running {len(chunks)} tasks with chunk size {effective_chunk_size} across {effective_processes} process(es).")
 
     write_block_rows = (not args.no_block_table) or args.html_dashboard
     with tempfile.TemporaryDirectory(prefix="maf_stats_tmp_", dir=out_dir) as tmp_dir:
         results = []
-        with ProcessPoolExecutor(max_workers=args.processes) as executor:
-            futures = []
-            for task_id, chunk in enumerate(chunks, start=1):
-                futures.append(
+        if effective_processes > 1:
+            with ProcessPoolExecutor(max_workers=effective_processes) as executor:
+                futures = [
                     executor.submit(
                         workerTask,
                         task_id,
@@ -1207,9 +1230,23 @@ def run_stats(args, cmdline="mafutils stats"):
                         write_block_rows,
                         tmp_dir,
                     )
+                    for task_id, chunk in enumerate(chunks, start=1)
+                ]
+                for f in futures:
+                    results.append(f.result())
+        else:
+            # Skip ProcessPoolExecutor entirely at processes=1 -- pool
+            # creation carries a large, mostly-fixed memory cost regardless
+            # of worker count (confirmed via mafutils gc's equivalent
+            # parallel/sequential split -- see DEVELOPMENT.md), not worth
+            # paying for a single worker that does the exact same work
+            # in-process anyway. workerTask is a plain function with no
+            # pool-initializer dependency, so calling it directly here is
+            # equivalent to submitting it to a 1-worker pool.
+            for task_id, chunk in enumerate(chunks, start=1):
+                results.append(
+                    workerTask(task_id, args.maf_file, maf_compression, chunk, write_block_rows, tmp_dir)
                 )
-            for f in futures:
-                results.append(f.result())
 
         overall, species, observed_species, block_tmp_paths = mergeStats(results)
 
@@ -1279,14 +1316,18 @@ def run_stats(args, cmdline="mafutils stats"):
 
 
 def stats_command(
-    maf_file: Annotated[str, typer.Argument(help="Input MAF file (.maf or .maf.gz)")],
-    index_file: Annotated[str, typer.Argument(help="Block index from mafutils index")],
+    maf_file: Annotated[str, typer.Argument(help="Input MAF file (.maf, .maf.gz, or bgzip-compressed .maf)")],
+    index_file: Annotated[
+        Optional[str],
+        typer.Argument(help="Block index from mafutils index. Required -- if omitted, looked up at <MAF_FILE>.block.idx by default; errors if not found there."),
+    ] = None,
     output_prefix: Annotated[str, typer.Option("--output-prefix", "-o", help="Output prefix/path (default: maf_stats)")] = "maf_stats",
     processes: Annotated[int, typer.Option("--processes", "-p", help="Number of worker processes (default: 1)")] = 1,
     chunk_size: Annotated[int, typer.Option("--chunk-size", help="Blocks per worker task (default: 5000)")] = 5000,
     no_block_table: Annotated[bool, typer.Option("--no-block-table", help="Skip writing the per-block output table for faster/lighter runs.")] = False,
     expected_species: Annotated[str, typer.Option("--expected-species", help="Comma-separated species names for exact per-block missing lists.")] = "",
     expected_species_file: Annotated[str, typer.Option("--expected-species-file", help="File with one species name per line for exact missing lists.")] = "",
+    verify_hash: Annotated[bool, typer.Option("--verify-hash", help="Verify the index's stored content hash against the MAF file (reads the whole file).")] = False,
     log_level: Annotated[LogLevel, typer.Option("--log-level", help="Logging level (default: INFO)")] = LogLevel.INFO,
     html_dashboard: Annotated[bool, typer.Option("--html-dashboard", help="Write an HTML dashboard with summary metrics and species plots.")] = False,
     dashboard_top_species: Annotated[int, typer.Option("--dashboard-top-species", help="Number of species to show in each dashboard bar plot (default: 25).")] = 25,
@@ -1301,6 +1342,7 @@ def stats_command(
         no_block_table=no_block_table,
         expected_species=expected_species,
         expected_species_file=expected_species_file,
+        verify_hash=verify_hash,
         log_level=log_level.value,
         html_dashboard=html_dashboard,
         dashboard_top_species=dashboard_top_species,

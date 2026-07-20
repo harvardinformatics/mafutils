@@ -1,0 +1,348 @@
+time -p mafutils index cricetid-15spec.Mus_musculus.nodupes.maf
+real 197.77
+user 185.05
+sys 11.46
+
+time -p mafutils validate cricetid-15spec.Mus_musculus.nodupes.maf
+[ 2026-07-17 12:36:33 - INFO ] mafutils validate called as: mafutils validate cricetid-15spec.Mus_musculus.nodupes.maf
+[ 2026-07-17 12:36:33 - INFO ] Using index at default location: cricetid-15spec.Mus_musculus.nodupes.maf.block.idx
+[ 2026-07-17 12:37:40 - INFO ] compression: match (index=none)
+[ 2026-07-17 12:37:40 - INFO ] size       : match (index=42697641453)
+[ 2026-07-17 12:37:40 - INFO ] hash       : match (index=md5:2e228a15e5daad2681927958b50c1bda)
+[ 2026-07-17 12:37:40 - INFO ] mtime      : match (index=1784218269.0)
+[ 2026-07-17 12:37:40 - INFO ] VERDICT: VERIFIED -- cricetid-15spec.Mus_musculus.nodupes.maf matches its index exactly.
+real 67.68
+user 59.26
+sys 7.23
+
+time -p mafutils stats -p 8 --expected-species-file ../species-names.txt --html-dashboard cricetid-15spec.Mus_musculus.nodupes.maf
+[ 2026-07-17 12:39:10 - INFO ] mafutils stats called as: mafutils stats -p 8 --expected-species-file ../species-names.txt --html-dashboard cricetid-15spec.Mus_musculus.nodupes.maf
+[ 2026-07-17 12:39:10 - INFO ] ----------------------------------------
+[ 2026-07-17 12:39:10 - INFO ] maf_file               : cricetid-15spec.Mus_musculus.nodupes.maf
+[ 2026-07-17 12:39:10 - INFO ] index_file             : None
+[ 2026-07-17 12:39:10 - INFO ] output_prefix          : maf_stats
+[ 2026-07-17 12:39:10 - INFO ] processes              : 8
+[ 2026-07-17 12:39:10 - INFO ] chunk_size             : 5000
+[ 2026-07-17 12:39:10 - INFO ] no_block_table         : False
+[ 2026-07-17 12:39:10 - INFO ] expected_species       :
+[ 2026-07-17 12:39:10 - INFO ] expected_species_file  : ../species-names.txt
+[ 2026-07-17 12:39:10 - INFO ] verify_hash            : False
+[ 2026-07-17 12:39:10 - INFO ] log_level              : INFO
+[ 2026-07-17 12:39:10 - INFO ] html_dashboard         : True
+[ 2026-07-17 12:39:10 - INFO ] dashboard_top_species  : 25
+[ 2026-07-17 12:39:10 - INFO ] dashboard_max_block_points : 50000
+[ 2026-07-17 12:39:10 - INFO ] ----------------------------------------
+[ 2026-07-17 12:39:10 - INFO ] Using index at default location: cricetid-15spec.Mus_musculus.nodupes.maf.block.idx
+[ 2026-07-17 12:39:10 - INFO ] Loaded 15 expected species for exact missing-species reporting.
+[ 2026-07-17 12:39:10 - INFO ] Parsing index file: cricetid-15spec.Mus_musculus.nodupes.maf.block.idx
+[ 2026-07-17 12:39:17 - INFO ] Loaded 8094203 indexed blocks.
+[ 2026-07-17 12:39:18 - INFO ] Running 1619 tasks with chunk size 5000 across 8 process(es).
+[ 2026-07-17 12:51:51 - INFO ] Writing overall stats: maf_stats.overall.tsv
+[ 2026-07-17 12:51:51 - INFO ] Writing species stats: maf_stats.species.tsv
+[ 2026-07-17 12:51:51 - INFO ] Writing HTML dashboard: maf_stats.dashboard.html
+[ 2026-07-17 12:52:08 - INFO ] Writing block stats: maf_stats.block.tsv
+[ 2026-07-17 12:52:38 - INFO ] Done.
+real 809.61
+user 48.71
+sys 7.93
+
+time -p mafutils gc -p 8 cricetid-15spec.Mus_musculus.nodupes.maf
+[ 2026-07-17 14:25:16 - INFO ] mafutils gc called as: mafutils gc -p 8 cricetid-15spec.Mus_musculus.nodupes.maf
+[ 2026-07-17 14:25:16 - INFO ] ----------------------------------------
+[ 2026-07-17 14:25:16 - INFO ] maf_file         : cricetid-15spec.Mus_musculus.nodupes.maf
+[ 2026-07-17 14:25:16 - INFO ] index_file       : None
+[ 2026-07-17 14:25:16 - INFO ] output_prefix    : maf_gc
+[ 2026-07-17 14:25:16 - INFO ] processes        : 8
+[ 2026-07-17 14:25:16 - INFO ] chunk_size       : 5000
+[ 2026-07-17 14:25:16 - INFO ] verify_hash      : False
+[ 2026-07-17 14:25:16 - INFO ] log_level        : INFO
+[ 2026-07-17 14:25:16 - INFO ] ----------------------------------------
+[ 2026-07-17 14:25:16 - INFO ] Found index at default location, will use if eligible: cricetid-15spec.Mus_musculus.nodupes.maf.block.idx
+[ 2026-07-17 14:25:16 - INFO ] Running in PARALLEL mode (none MAF + index + processes > 1)
+[ 2026-07-17 14:25:16 - INFO ] Parsing index file: cricetid-15spec.Mus_musculus.nodupes.maf.block.idx
+[ 2026-07-17 14:25:21 - INFO ] Loaded 8094203 indexed blocks.
+[ 2026-07-17 14:25:21 - INFO ] Running 1619 tasks with chunk size 5000 across 8 process(es).
+[ 2026-07-17 14:28:48 - INFO ] Writing per-species GC: maf_gc.gc.csv
+[ 2026-07-17 14:28:48 - INFO ] Writing mean GC: maf_gc.gc.mean.txt
+[ 2026-07-17 14:28:48 - INFO ] Computed GC for 15 species; mean GC = 0.41977364
+[ 2026-07-17 14:28:48 - INFO ] Done.
+real 213.53
+user 7.55
+sys 1.50
+
+ time -p mafutils fetch -b coords --fasta --expected-species-file ../species-names.txt --fasta-dedupe most-seq -p 8 -o combined-ucsc-peaks.merged-d5.min50.genbank-fa cricetid-15spec.Mus_musculus.nodupes.maf ../combined-ucsc-peaks.merged-d5.min50.genbank.bed
+[ 2026-07-17 14:52:58 - INFO ] mafutils fetch called as: mafutils fetch -b coords --fasta --expected-species-file ../species-names.txt --fasta-dedupe most-seq -p 8 -o combined-ucsc-peaks.merged-d5.min50.genbank-fa cricetid-15spec.Mus_musculus.nodupes.maf ../combined-ucsc-peaks.merged-d5.min50.genbank.bed
+[ 2026-07-17 14:52:58 - INFO ] ----------------------------------------
+[ 2026-07-17 14:52:58 - INFO ] maf_file             : cricetid-15spec.Mus_musculus.nodupes.maf
+[ 2026-07-17 14:52:58 - INFO ] index_file           : None
+[ 2026-07-17 14:52:58 - INFO ] bed_file             : ../combined-ucsc-peaks.merged-d5.min50.genbank.bed
+[ 2026-07-17 14:52:58 - INFO ] basename             : coords
+[ 2026-07-17 14:52:58 - INFO ] output               : combined-ucsc-peaks.merged-d5.min50.genbank-fa
+[ 2026-07-17 14:52:58 - INFO ] fasta                : True
+[ 2026-07-17 14:52:58 - INFO ] fasta_header         : species-coords
+[ 2026-07-17 14:52:58 - INFO ] expected_species     :
+[ 2026-07-17 14:52:58 - INFO ] expected_species_file : ../species-names.txt
+[ 2026-07-17 14:52:58 - INFO ] fasta_dedupe         : most-seq
+[ 2026-07-17 14:52:58 - INFO ] processes            : 8
+[ 2026-07-17 14:52:58 - INFO ] mode                 : block
+[ 2026-07-17 14:52:58 - INFO ] single_output        : False
+[ 2026-07-17 14:52:58 - INFO ] verbose              : False
+[ 2026-07-17 14:52:58 - INFO ] profile              : False
+[ 2026-07-17 14:52:58 - INFO ] verify_hash          : False
+[ 2026-07-17 14:52:58 - INFO ] ----------------------------------------
+[ 2026-07-17 14:52:58 - INFO ] Using index at default location: cricetid-15spec.Mus_musculus.nodupes.maf.block.idx
+[ 2026-07-17 14:52:58 - INFO ] Parsing index file.... cricetid-15spec.Mus_musculus.nodupes.maf.block.idx
+[ 2026-07-17 14:53:10 - INFO ] Parsing BED file...... ../combined-ucsc-peaks.merged-d5.min50.genbank.bed
+[ 2026-07-17 14:53:15 - INFO ] Loaded 15 expected species for FASTA missing-species filling.
+[ 2026-07-17 14:53:15 - INFO ] Getting MAF header.... cricetid-15spec.Mus_musculus.nodupes.maf
+[ 2026-07-17 14:53:15 - INFO ] Running in BLOCK mode
+[ 2026-07-17 14:53:15 - INFO ] Using batch size of 61216 regions for 979442 total regions with 8 processes.
+[ 2026-07-17 14:53:15 - INFO ] Divided 979442 regions into 16 batches of up to 61216 regions each.
+[ 2026-07-17 14:57:08 - WARNING ] Completed batch 5: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2063
+[ 2026-07-17 14:57:15 - WARNING ] Completed batch 7: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=3104
+[ 2026-07-17 14:57:20 - WARNING ] Completed batch 2: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2433
+[ 2026-07-17 14:57:21 - WARNING ] Completed batch 4: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=3203
+[ 2026-07-17 14:57:22 - WARNING ] Completed batch 6: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2155
+[ 2026-07-17 14:57:27 - WARNING ] Completed batch 3: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=1881
+[ 2026-07-17 14:58:12 - WARNING ] Completed batch 8: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2273
+[ 2026-07-17 14:58:49 - WARNING ] Completed batch 1: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2348
+[ 2026-07-17 15:01:09 - WARNING ] Completed batch 14: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2635
+[ 2026-07-17 15:01:25 - WARNING ] Completed batch 9: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=1997
+[ 2026-07-17 15:01:29 - WARNING ] Completed batch 11: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2099
+[ 2026-07-17 15:01:43 - WARNING ] Completed batch 10: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2218
+[ 2026-07-17 15:01:47 - WARNING ] Completed batch 15: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2132
+[ 2026-07-17 15:01:55 - WARNING ] Completed batch 12: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2436
+[ 2026-07-17 15:01:57 - WARNING ] Completed batch 13: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=4395
+[ 2026-07-17 15:02:05 - WARNING ] Completed batch 16: 61202 total / 61202 written / 0 no-output / warnings: multiple-strands=3589
+real 549.67
+user 43.90
+sys 9.13
+
+---------------------------------------------------------------------
+
+time -p mafutils index cricetid-15spec.Mus_musculus.nodupes.maf.gz
+real 685.60
+user 680.49
+sys 2.38
+
+time -p mafutils validate cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 15:48:42 - INFO ] mafutils validate called as: mafutils validate cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 15:48:42 - INFO ] Using index at default location: cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 15:48:54 - INFO ] compression: match (index=gz)
+[ 2026-07-17 15:48:54 - INFO ] size       : match (index=7063057179)
+[ 2026-07-17 15:48:54 - INFO ] hash       : match (index=md5:acbe828e19d061339a2f4e62bd6200e3)
+[ 2026-07-17 15:48:54 - INFO ] mtime      : match (index=1784218269.0)
+[ 2026-07-17 15:48:54 - INFO ] VERDICT: VERIFIED -- cricetid-15spec.Mus_musculus.nodupes.maf.gz matches its index exactly.
+real 12.92
+user 10.16
+sys 1.79
+
+time -p mafutils stats -p 8 --expected-species-file ../species-names.txt --html-dashboard cricetid-15spec.Mus_musculus.nodupes.maf.gz cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 15:49:37 - INFO ] mafutils stats called as: mafutils stats -p 8 --expected-species-file ../species-names.txt --html-dashboard cricetid-15spec.Mus_musculus.nodupes.maf.gz cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 15:49:37 - INFO ] ----------------------------------------
+[ 2026-07-17 15:49:37 - INFO ] maf_file               : cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 15:49:37 - INFO ] index_file             : cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 15:49:37 - INFO ] output_prefix          : maf_stats
+[ 2026-07-17 15:49:37 - INFO ] processes              : 8
+[ 2026-07-17 15:49:37 - INFO ] chunk_size             : 5000
+[ 2026-07-17 15:49:37 - INFO ] no_block_table         : False
+[ 2026-07-17 15:49:37 - INFO ] expected_species       :
+[ 2026-07-17 15:49:37 - INFO ] expected_species_file  : ../species-names.txt
+[ 2026-07-17 15:49:37 - INFO ] verify_hash            : False
+[ 2026-07-17 15:49:37 - INFO ] log_level              : INFO
+[ 2026-07-17 15:49:37 - INFO ] html_dashboard         : True
+[ 2026-07-17 15:49:37 - INFO ] dashboard_top_species  : 25
+[ 2026-07-17 15:49:37 - INFO ] dashboard_max_block_points : 50000
+[ 2026-07-17 15:49:37 - INFO ] ----------------------------------------
+[ 2026-07-17 15:49:37 - INFO ] Loaded 15 expected species for exact missing-species reporting.
+[ 2026-07-17 15:49:37 - INFO ] Parsing index file: cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 15:49:45 - INFO ] Loaded 8094203 indexed blocks.
+[ 2026-07-17 15:49:45 - WARNING ] Parallel processing requires random access into the MAF, which is inefficient on gzip-compressed files: the index's byte offsets are positions in the decompressed stream, so each worker would have to redundantly re-decompress everything before its own start point. Falling back to a single sequential pass; --processes will be ignored. (Use a bgzip-compressed MAF for real parallel speedup on compressed input.)
+[ 2026-07-17 15:49:45 - INFO ] Running 1 tasks with chunk size 8094203 across 1 process(es).
+[ 2026-07-17 17:25:34 - INFO ] Writing overall stats: maf_stats.overall.tsv
+[ 2026-07-17 17:25:34 - INFO ] Writing species stats: maf_stats.species.tsv
+[ 2026-07-17 17:25:34 - INFO ] Writing HTML dashboard: maf_stats.dashboard.html
+[ 2026-07-17 17:25:51 - INFO ] Writing block stats: maf_stats.block.tsv
+[ 2026-07-17 17:26:20 - INFO ] Done.
+real 5803.68
+user 50.73
+sys 5.58
+
+time -p mafutils gc -p 8 cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 23:02:46 - INFO ] mafutils gc called as: mafutils gc -p 8 cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 23:02:46 - INFO ] ----------------------------------------
+[ 2026-07-17 23:02:46 - INFO ] maf_file         : cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 23:02:46 - INFO ] index_file       : None
+[ 2026-07-17 23:02:46 - INFO ] output_prefix    : maf_gc
+[ 2026-07-17 23:02:46 - INFO ] processes        : 8
+[ 2026-07-17 23:02:46 - INFO ] chunk_size       : 5000
+[ 2026-07-17 23:02:46 - INFO ] verify_hash      : False
+[ 2026-07-17 23:02:46 - INFO ] log_level        : INFO
+[ 2026-07-17 23:02:46 - INFO ] ----------------------------------------
+[ 2026-07-17 23:02:46 - INFO ] Found index at default location, will use if eligible: cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 23:02:46 - WARNING ] Parallel processing requires random access into the MAF, which is inefficient on gzip-compressed files: the index's byte offsets are positions in the decompressed stream, so each worker would have to redundantly re-decompress everything before its own start point. Falling back to a single sequential pass; --processes will be ignored. (Use a bgzip-compressed MAF for real parallel speedup on compressed input.)
+[ 2026-07-17 23:02:46 - INFO ] Running in SEQUENTIAL mode
+[ 2026-07-17 23:24:27 - INFO ] Writing per-species GC: maf_gc.gc.csv
+[ 2026-07-17 23:24:27 - INFO ] Writing mean GC: maf_gc.gc.mean.txt
+[ 2026-07-17 23:24:27 - INFO ] Computed GC for 15 species; mean GC = 0.41977364
+[ 2026-07-17 23:24:27 - INFO ] Done.
+real 1302.45
+user 1296.96
+sys 1.71
+
+time -p mafutils fetch -b coords --fasta --expected-species-file ../species-names.txt --fasta-dedupe most-seq -p 8 -o combined-uscs-peaks.merged-d5.min50.genbank-fa cricetid-15spec.Mus_musculus.nodupes.maf.gz ../combined-ucsc-peaks.merged-d5.min50.genbank.bed
+[ 2026-07-18 13:31:05 - INFO ] mafutils fetch called as: mafutils fetch -b coords --fasta --expected-species-file ../species-names.txt --fasta-dedupe most-seq -p 8 -o combined-uscs-peaks.merged-d5.min50.genbank-fa cricetid-15spec.Mus_musculus.nodupes.maf.gz ../combined-ucsc-peaks.merged-d5.min50.genbank.bed
+[ 2026-07-18 13:31:05 - INFO ] ----------------------------------------
+[ 2026-07-18 13:31:05 - INFO ] maf_file             : cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-18 13:31:05 - INFO ] index_file           : None
+[ 2026-07-18 13:31:05 - INFO ] bed_file             : ../combined-ucsc-peaks.merged-d5.min50.genbank.bed
+[ 2026-07-18 13:31:05 - INFO ] basename             : coords
+[ 2026-07-18 13:31:05 - INFO ] output               : combined-uscs-peaks.merged-d5.min50.genbank-fa
+[ 2026-07-18 13:31:05 - INFO ] fasta                : True
+[ 2026-07-18 13:31:05 - INFO ] fasta_header         : species-coords
+[ 2026-07-18 13:31:05 - INFO ] expected_species     :
+[ 2026-07-18 13:31:05 - INFO ] expected_species_file : ../species-names.txt
+[ 2026-07-18 13:31:05 - INFO ] fasta_dedupe         : most-seq
+[ 2026-07-18 13:31:05 - INFO ] processes            : 8
+[ 2026-07-18 13:31:05 - INFO ] mode                 : block
+[ 2026-07-18 13:31:05 - INFO ] single_output        : False
+[ 2026-07-18 13:31:05 - INFO ] verbose              : False
+[ 2026-07-18 13:31:05 - INFO ] profile              : False
+[ 2026-07-18 13:31:05 - INFO ] verify_hash          : False
+[ 2026-07-18 13:31:05 - INFO ] ----------------------------------------
+[ 2026-07-18 13:31:05 - INFO ] Using index at default location: cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-18 13:31:05 - INFO ] Parsing index file.... cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-18 13:31:17 - INFO ] Parsing BED file...... ../combined-ucsc-peaks.merged-d5.min50.genbank.bed
+[ 2026-07-18 13:31:22 - INFO ] Loaded 15 expected species for FASTA missing-species filling.
+[ 2026-07-18 13:31:22 - INFO ] Getting MAF header.... cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-18 13:31:22 - INFO ] Running in BLOCK mode
+[ 2026-07-18 13:31:22 - WARNING ] Parallel processing requires random access into the MAF, which is inefficient on gzip-compressed files: the index's byte offsets are positions in the decompressed stream, so each worker would have to redundantly re-decompress everything before its own start point. Falling back to a single sequential pass; --processes will be ignored. (Use a bgzip-compressed MAF for real parallel speedup on compressed input.)
+[ 2026-07-18 13:49:17 - INFO ] Prefetching 1031475 distinct block(s) needed across all regions (gzip input).
+[ 2026-07-18 13:51:13 - INFO ] Using batch size of 489721 regions for 979442 total regions with 1 processes.
+[ 2026-07-18 13:51:13 - INFO ] Divided 979442 regions into 2 batches of up to 489721 regions each.
+[ 2026-07-18 14:14:26 - WARNING ] Completed batch 1: 489721 total / 489721 written / 0 no-output / warnings: multiple-strands=19460
+[ 2026-07-18 14:39:46 - WARNING ] Completed batch 2: 489721 total / 489721 written / 0 no-output / warnings: multiple-strands=21501
+real 4124.49
+user 1200.72
+sys 14.58
+
+---------------------------------------------------------------------
+
+time -p mafutils index cricetid-15spec.Mus_musculus.nodupes.maf.gz
+real 255.30
+user 251.65
+sys 2.53
+
+time -p mafutils validate cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 15:53:14 - INFO ] mafutils validate called as: mafutils validate cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 15:53:14 - INFO ] Using index at default location: cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 15:53:26 - INFO ] compression: match (index=bgzip)
+[ 2026-07-17 15:53:26 - INFO ] size       : match (index=7356276471)
+[ 2026-07-17 15:53:26 - INFO ] hash       : match (index=md5:e6b45be3b256b30a2cee54548d8c6eff)
+[ 2026-07-17 15:53:26 - INFO ] mtime      : match (index=1784218269.0)
+[ 2026-07-17 15:53:26 - INFO ] VERDICT: VERIFIED -- cricetid-15spec.Mus_musculus.nodupes.maf.gz matches its index exactly.
+real 13.37
+user 10.49
+sys 1.57
+
+time -p mafutils stats -p 8 --expected-species-file ../species-names.txt --html-dashboard cricetid-15spec.Mus_musculus.nodupes.maf.gz cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 10:19:57 - INFO ] mafutils stats called as: mafutils stats -p 8 --expected-species-file ../species-names.txt --html-dashboard cricetid-15spec.Mus_musculus.nodupes.maf.gz cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 10:19:57 - INFO ] ----------------------------------------
+[ 2026-07-17 10:19:57 - INFO ] maf_file               : cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 10:19:57 - INFO ] index_file             : cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 10:19:57 - INFO ] output_prefix          : maf_stats
+[ 2026-07-17 10:19:57 - INFO ] processes              : 8
+[ 2026-07-17 10:19:57 - INFO ] chunk_size             : 5000
+[ 2026-07-17 10:19:57 - INFO ] no_block_table         : False
+[ 2026-07-17 10:19:57 - INFO ] expected_species       :
+[ 2026-07-17 10:19:57 - INFO ] expected_species_file  : ../species-names.txt
+[ 2026-07-17 10:19:57 - INFO ] verify_hash            : False
+[ 2026-07-17 10:19:57 - INFO ] log_level              : INFO
+[ 2026-07-17 10:19:57 - INFO ] html_dashboard         : True
+[ 2026-07-17 10:19:57 - INFO ] dashboard_top_species  : 25
+[ 2026-07-17 10:19:57 - INFO ] dashboard_max_block_points : 50000
+[ 2026-07-17 10:19:57 - INFO ] ----------------------------------------
+[ 2026-07-17 10:19:57 - INFO ] Loaded 15 expected species for exact missing-species reporting.
+[ 2026-07-17 10:19:57 - INFO ] Parsing index file: cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 10:20:05 - INFO ] Loaded 8094203 indexed blocks.
+[ 2026-07-17 10:20:05 - INFO ] Running 1619 tasks with chunk size 5000 across 8 process(es).
+[ 2026-07-17 10:33:09 - INFO ] Writing overall stats: maf_stats.overall.tsv
+[ 2026-07-17 10:33:09 - INFO ] Writing species stats: maf_stats.species.tsv
+[ 2026-07-17 10:33:09 - INFO ] Writing HTML dashboard: maf_stats.dashboard.html
+[ 2026-07-17 10:33:39 - INFO ] Writing block stats: maf_stats.block.tsv
+[ 2026-07-17 10:34:11 - INFO ] Done.
+real 856.48
+user 50.75
+sys 7.54
+
+time -p mafutils gc -p 8 cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 10:48:10 - INFO ] mafutils gc called as: mafutils gc -p 8 cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 10:48:10 - INFO ] ----------------------------------------
+[ 2026-07-17 10:48:10 - INFO ] maf_file         : cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 10:48:10 - INFO ] index_file       : None
+[ 2026-07-17 10:48:10 - INFO ] output_prefix    : maf_gc
+[ 2026-07-17 10:48:10 - INFO ] processes        : 8
+[ 2026-07-17 10:48:10 - INFO ] chunk_size       : 5000
+[ 2026-07-17 10:48:10 - INFO ] verify_hash      : False
+[ 2026-07-17 10:48:10 - INFO ] log_level        : INFO
+[ 2026-07-17 10:48:10 - INFO ] ----------------------------------------
+[ 2026-07-17 10:48:10 - INFO ] Found index at default location, will use if eligible: cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 10:48:10 - INFO ] Running in PARALLEL mode (bgzip MAF + index + processes > 1)
+[ 2026-07-17 10:48:10 - INFO ] Parsing index file: cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 10:48:15 - INFO ] Loaded 8094203 indexed blocks.
+[ 2026-07-17 10:48:15 - INFO ] Running 1619 tasks with chunk size 5000 across 8 process(es).
+[ 2026-07-17 10:51:27 - INFO ] Writing per-species GC: maf_gc.gc.csv
+[ 2026-07-17 10:51:27 - INFO ] Writing mean GC: maf_gc.gc.mean.txt
+[ 2026-07-17 10:51:27 - INFO ] Computed GC for 15 species; mean GC = 0.41977364
+[ 2026-07-17 10:51:27 - INFO ] Done.
+real 197.90
+user 7.52
+sys 1.34
+
+time -p mafutils fetch -b coords --fasta --expected-species-file ../species-names.txt --fasta-dedupe most-seq -p 8 cricetid-15spec.Mus_musculus.nodupes.maf.gz ../combined-ucsc-peaks.merged-d5.min50.genbank.bed
+[ 2026-07-17 10:57:48 - INFO ] mafutils fetch called as: mafutils fetch -b coords --fasta --expected-species-file ../species-names.txt --fasta-dedupe most-seq -p 8 cricetid-15spec.Mus_musculus.nodupes.maf.gz ../combined-ucsc-peaks.merged-d5.min50.genbank.bed
+[ 2026-07-17 10:57:48 - INFO ] ----------------------------------------
+[ 2026-07-17 10:57:48 - INFO ] maf_file             : cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 10:57:48 - INFO ] index_file           : None
+[ 2026-07-17 10:57:48 - INFO ] bed_file             : ../combined-ucsc-peaks.merged-d5.min50.genbank.bed
+[ 2026-07-17 10:57:48 - INFO ] basename             : coords
+[ 2026-07-17 10:57:48 - INFO ] output               : .
+[ 2026-07-17 10:57:48 - INFO ] fasta                : True
+[ 2026-07-17 10:57:48 - INFO ] fasta_header         : species-coords
+[ 2026-07-17 10:57:48 - INFO ] expected_species     :
+[ 2026-07-17 10:57:48 - INFO ] expected_species_file : ../species-names.txt
+[ 2026-07-17 10:57:48 - INFO ] fasta_dedupe         : most-seq
+[ 2026-07-17 10:57:48 - INFO ] processes            : 8
+[ 2026-07-17 10:57:48 - INFO ] mode                 : block
+[ 2026-07-17 10:57:48 - INFO ] single_output        : False
+[ 2026-07-17 10:57:48 - INFO ] verbose              : False
+[ 2026-07-17 10:57:48 - INFO ] profile              : False
+[ 2026-07-17 10:57:48 - INFO ] verify_hash          : False
+[ 2026-07-17 10:57:48 - INFO ] ----------------------------------------
+[ 2026-07-17 10:57:48 - INFO ] Using index at default location: cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 10:57:48 - INFO ] Parsing index file.... cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
+[ 2026-07-17 10:58:00 - INFO ] Parsing BED file...... ../combined-ucsc-peaks.merged-d5.min50.genbank.bed
+[ 2026-07-17 10:58:02 - INFO ] Loaded 15 expected species for FASTA missing-species filling.
+[ 2026-07-17 10:58:02 - INFO ] Getting MAF header.... cricetid-15spec.Mus_musculus.nodupes.maf.gz
+[ 2026-07-17 10:58:02 - INFO ] Running in BLOCK mode
+[ 2026-07-17 10:58:02 - INFO ] Using batch size of 61216 regions for 979442 total regions with 8 processes.
+[ 2026-07-17 10:58:02 - INFO ] Divided 979442 regions into 16 batches of up to 61216 regions each.
+[ 2026-07-17 11:20:48 - WARNING ] Completed batch 7: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=3104
+[ 2026-07-17 11:20:49 - WARNING ] Completed batch 2: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2433
+[ 2026-07-17 11:20:53 - WARNING ] Completed batch 3: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=1881
+[ 2026-07-17 11:20:53 - WARNING ] Completed batch 6: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2155
+[ 2026-07-17 11:20:53 - WARNING ] Completed batch 5: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2063
+[ 2026-07-17 11:25:33 - WARNING ] Completed batch 4: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=3203
+[ 2026-07-17 11:26:02 - WARNING ] Completed batch 8: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2273
+[ 2026-07-17 11:29:23 - WARNING ] Completed batch 1: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2348
+[ 2026-07-17 11:45:06 - WARNING ] Completed batch 14: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2635
+[ 2026-07-17 11:45:33 - WARNING ] Completed batch 15: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2132
+[ 2026-07-17 11:45:37 - WARNING ] Completed batch 9: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=1997
+[ 2026-07-17 11:45:41 - WARNING ] Completed batch 13: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=4395
+[ 2026-07-17 11:45:48 - WARNING ] Completed batch 16: 61202 total / 61202 written / 0 no-output / warnings: multiple-strands=3589
+[ 2026-07-17 11:45:49 - WARNING ] Completed batch 11: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2099
+[ 2026-07-17 11:45:56 - WARNING ] Completed batch 10: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2218
+[ 2026-07-17 11:46:12 - WARNING ] Completed batch 12: 61216 total / 61216 written / 0 no-output / warnings: multiple-strands=2436
+real 2906.38
+user 43.31
+sys 5.86
