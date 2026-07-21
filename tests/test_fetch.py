@@ -118,3 +118,64 @@ def test_maf_fetch_fasta_region(chrom, start, end, region_id, tmp_path):
     expected = expected.rstrip('\n')
 
     assert got == expected, f"FASTA output for region {region_id} does not match expected"
+
+
+def test_scaffold_subdirs_groups_output_by_scaffold(tmp_path):
+    """
+    --scaffold-subdirs groups per-region output files into
+    <outdir>/<scaffold>/<basename>.maf instead of a flat <outdir>/. Runs
+    with -p 2 (real multi-worker ProcessPoolExecutor dispatch, matching how
+    block-mode writes actually happen) across regions spanning multiple
+    scaffolds, including two scaffolds (chr1, chr4) with multiple regions
+    each, to confirm they land in the same subdirectory without any
+    cross-worker race (directories are pre-created upfront, see fetch.py).
+    """
+    out_dir = str(tmp_path)
+    cmd = [
+        sys.executable, "-m", "mafutils", "fetch",
+        MAF_FILE, BED_FILE,
+        "--index", INDEX_FILE,
+        "-b", "id",
+        "-o", out_dir,
+        "--scaffold-subdirs",
+        "-p", "2",
+    ]
+    result = subprocess.run(cmd, check=False, cwd=REPO_ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, f"Unexpected non-zero exit: {result.stderr}"
+
+    # chr1 has 3 regions with real output (06-noalign has no overlap, so no
+    # file); chr4 has 2; chr2/chr3/chrX have 1 each. chrZ (09-missingchrom)
+    # never gets that far (unknown scaffold errors before any writes).
+    assert sorted(os.listdir(os.path.join(out_dir, "chr1"))) == [
+        "01-singleblock-gap.maf",
+        "02-truncatedblock.maf",
+        "03-crossblocks-missing.maf",
+    ]
+    assert os.listdir(os.path.join(out_dir, "chr2")) == ["04-singleblock.maf"]
+    assert os.listdir(os.path.join(out_dir, "chr3")) == ["05-crossblocks.maf"]
+    assert os.listdir(os.path.join(out_dir, "chrX")) == ["07-negstrand.maf"]
+    assert sorted(os.listdir(os.path.join(out_dir, "chr4"))) == [
+        "08-span-multiple-gaps.maf",
+        "10-crossblocks-missing-species.maf",
+    ]
+
+    # Content should be identical to the flat-layout output for the same region.
+    with open(os.path.join(out_dir, "chr2", "04-singleblock.maf")) as fp:
+        got = fp.read().rstrip("\n")
+    with open(os.path.join(EXPECTED_MAF_DIR, "04-singleblock.maf")) as fp:
+        expected = fp.read().rstrip("\n")
+    assert got == expected
+
+
+def test_scaffold_subdirs_rejected_with_single_output(tmp_path):
+    cmd = [
+        sys.executable, "-m", "mafutils", "fetch",
+        MAF_FILE, BED_FILE,
+        "--index", INDEX_FILE,
+        "--scaffold-subdirs",
+        "--single-output",
+        "-o", os.path.join(str(tmp_path), "out.maf"),
+    ]
+    result = subprocess.run(cmd, check=False, cwd=REPO_ROOT, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "--scaffold-subdirs cannot be used with --single-output" in result.stderr

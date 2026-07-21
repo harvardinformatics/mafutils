@@ -187,7 +187,24 @@ pytest tests/
 per-command parallel/sequential/fallback logic) across all three compression
 types. `tests/test_validate.py` covers index integrity (size/mtime/hash
 header fields, `mafutils validate`'s three-way verdict, and `--verify-hash`
-on `fetch`/`stats`/`gc`).
+on `fetch`/`stats`/`gc`). `tests/test_stats.py` checks `mafutils stats`'s
+computed `overall.tsv`/`species.tsv` values against numbers hand-derived
+directly from `tests/example.maf`'s raw content (not just "doesn't crash"),
+including a regression guard that the sequential (`-p 1`, no
+`ProcessPoolExecutor`) and real multi-worker (`-p 2`+) paths produce
+identical output.
+
+`tests/test_real_data.py` runs `stats`/`gc`/`fetch` against
+`tests/real-excerpt.maf` -- 8 real, complete alignment blocks extracted
+read-only from gwct's actual ~42GB production MAF
+(`data/hamsters/uncompressed/...`), not hand-crafted. Unlike
+`example.maf`-based tests (which verify exact hand-computed values),
+these check plausibility/robustness on genuinely real data -- real
+species-naming conventions, real gap patterns, real block-size
+distribution -- since a hand-crafted fixture wouldn't think to include
+whatever real data actually looks like. This is deliberately still a
+tiny, committed fixture, not the real dataset itself: `data/hamsters/`
+stays untouched and out of git (see the `.gitignore` `data/` entry).
 
 ## Releasing to PyPI
 
