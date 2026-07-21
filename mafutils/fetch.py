@@ -90,6 +90,7 @@ WORKER_MAF_COMPRESSION = None
 WORKER_INDEX = None
 WORKER_OUTPUT = None
 WORKER_SINGLE_OUTPUT = None
+WORKER_SCAFFOLD_SUBDIRS = None
 WORKER_AS_FASTA = None
 WORKER_FASTA_HEADER = None
 WORKER_EXPECTED_SPECIES = None
@@ -174,6 +175,7 @@ def initBatchWorker(
     verbose,
     profile,
     prefetched_cache=None,
+    scaffold_subdirs=False,
 ):
     global WORKER_HEADER
     global WORKER_MAF_FILE
@@ -181,6 +183,7 @@ def initBatchWorker(
     global WORKER_INDEX
     global WORKER_OUTPUT
     global WORKER_SINGLE_OUTPUT
+    global WORKER_SCAFFOLD_SUBDIRS
     global WORKER_AS_FASTA
     global WORKER_FASTA_HEADER
     global WORKER_EXPECTED_SPECIES
@@ -196,6 +199,7 @@ def initBatchWorker(
     WORKER_INDEX = index
     WORKER_OUTPUT = output
     WORKER_SINGLE_OUTPUT = single_output
+    WORKER_SCAFFOLD_SUBDIRS = scaffold_subdirs
     WORKER_AS_FASTA = as_fasta
     WORKER_FASTA_HEADER = fasta_header
     WORKER_EXPECTED_SPECIES = expected_species
@@ -714,6 +718,20 @@ def trimMafBlock(block_text, bed_start, bed_end, BATCHLOG, verbose=False, warnin
 
 #############################################################################
 
+def buildOutputPath(output_dir, scaffold, out_basename, ext, scaffold_subdirs):
+    """
+    Shared per-output-file path builder for block mode (fetchByRegion) and
+    scaffold mode (fetchByScaffold/fetchScaffoldsSequential). The scaffold
+    subdirectory itself is never created here -- callers must pre-create
+    every needed one upfront (see run_fetch) before any of these paths are
+    actually opened for writing.
+    """
+    if scaffold_subdirs:
+        return os.path.join(output_dir, scaffold, out_basename + ext)
+    return os.path.join(output_dir, out_basename + ext)
+
+#############################################################################
+
 def fetchByRegion(
     region,
     header,
@@ -729,6 +747,7 @@ def fetchByRegion(
     verbose=False,
     warning_state=None,
     profile_state=None,
+    scaffold_subdirs=False,
 ):
     """
     Worker function to process a single BED region:
@@ -760,7 +779,7 @@ def fetchByRegion(
         fill_cache = {}
     # For fasta output, hold sequences per species
 
-    output_filename = os.path.join(output, out_basename + (".fa" if as_fasta else ".maf"))
+    output_filename = buildOutputPath(output, scaffold, out_basename, ".fa" if as_fasta else ".maf", scaffold_subdirs)
     out_stream = None
 
     if single_output:
@@ -997,6 +1016,7 @@ def fetchByBatch(
             verbose=WORKER_VERBOSE,
             warning_state=warning_state,
             profile_state=profile_state,
+            scaffold_subdirs=WORKER_SCAFFOLD_SUBDIRS,
         )
         batch_results[result_idx] = region_result
         if not WORKER_SINGLE_OUTPUT:
@@ -1027,13 +1047,13 @@ def fetchByBatch(
 
 #############################################################################
 
-def fetchByScaffold(scaffold, start_end, maf_file, maf_header, maf_compression, out_dir, LOG):
+def fetchByScaffold(scaffold, start_end, maf_file, maf_header, maf_compression, out_dir, LOG, scaffold_subdirs=False):
     """
     Worker function to extract one scaffold from the MAF file.
     start_end is a tuple (start_byte, end_byte).
     """
     start, end = start_end
-    output_path = os.path.join(out_dir, f"{scaffold}.maf")
+    output_path = buildOutputPath(out_dir, scaffold, scaffold, ".maf", scaffold_subdirs)
 
     try:
         with COMMON.openMaf(maf_file, maf_compression, "rb") as mfp, open(output_path, "wb") as outfp:
@@ -1047,7 +1067,7 @@ def fetchByScaffold(scaffold, start_end, maf_file, maf_header, maf_compression, 
     return f"{output_path}: Wrote {scaffold}";
 
 
-def fetchScaffoldsSequential(ordered_scaffolds, index, maf_file, maf_header, maf_compression, out_dir, LOG):
+def fetchScaffoldsSequential(ordered_scaffolds, index, maf_file, maf_header, maf_compression, out_dir, LOG, scaffold_subdirs=False):
     """
     Extracts multiple scaffolds using a single open MAF handle, in the given
     (ascending file-offset) order. Used for gzip input: reusing one handle
@@ -1058,7 +1078,7 @@ def fetchScaffoldsSequential(ordered_scaffolds, index, maf_file, maf_header, maf
     with COMMON.openMaf(maf_file, maf_compression, "rb") as mfp:
         for scaffold in ordered_scaffolds:
             start, end = index[scaffold]
-            output_path = os.path.join(out_dir, f"{scaffold}.maf")
+            output_path = buildOutputPath(out_dir, scaffold, scaffold, ".maf", scaffold_subdirs)
             try:
                 LOG.info(f">>> Scaffold {scaffold}");
                 data = COMMON.readMafBlockBytes(mfp, maf_compression, start, end)
@@ -1101,6 +1121,13 @@ def run_fetch(args, cmdline="mafutils fetch"):
         LOG.error(f"Invalid mode: '{args.mode}'. Must be 'block' or 'scaffold'.")
         sys.exit(1)
     # Validate mode
+
+    if args.scaffold_subdirs and args.single_output:
+        LOG.error("--scaffold-subdirs cannot be used with --single-output.")
+        sys.exit(1)
+    # --single-output collects blocks into one combined file and never uses
+    # per-region output_basename/output_filename at all, so it doesn't
+    # compose with grouping per-region files into scaffold subfolders.
     # if args.max_no_overlap_regions < -1:
     #     LOG.error("--max-no-overlap-regions must be >= -1.")
     #     sys.exit(1)
@@ -1171,6 +1198,12 @@ def run_fetch(args, cmdline="mafutils fetch"):
                 sys.exit(1)
         LOG.info(f"Extracting {len(scaffold_set)} scaffolds from scaffold index: {scaffold_set}");
 
+        if args.scaffold_subdirs:
+            # Pre-create upfront in the main process, same rationale as
+            # block mode below -- avoids any per-worker/cross-process race.
+            for scaffold in scaffold_set:
+                os.makedirs(os.path.join(args.output, scaffold), exist_ok=True)
+
         # Process scaffolds in ascending file-offset order; for gzip this is
         # what lets a single reused handle avoid ever seeking backward.
         ordered_scaffolds = sorted(scaffold_set, key=lambda s: index[s][0])
@@ -1182,7 +1215,7 @@ def run_fetch(args, cmdline="mafutils fetch"):
                     "gzip-compressed files; --processes will be ignored. (Use a bgzip-compressed MAF "
                     "for real parallel speedup on compressed input.)"
                 )
-            for result in fetchScaffoldsSequential(ordered_scaffolds, index, args.maf_file, maf_header, maf_compression, args.output, LOG):
+            for result in fetchScaffoldsSequential(ordered_scaffolds, index, args.maf_file, maf_header, maf_compression, args.output, LOG, scaffold_subdirs=args.scaffold_subdirs):
                 LOG.info(result)
         else:
             # Extract from MAF using the region index for matching scaffolds
@@ -1198,7 +1231,8 @@ def run_fetch(args, cmdline="mafutils fetch"):
                         maf_header,
                         maf_compression,
                         args.output,
-                        LOG
+                        LOG,
+                        args.scaffold_subdirs,
                     ))
                 for future in futures:
                     result = future.result()
@@ -1273,6 +1307,15 @@ def run_fetch(args, cmdline="mafutils fetch"):
         else: # basename_mode == "coords":
             region["output_basename"] = f"{scaffold}-{start}-{end}"
 
+    if args.scaffold_subdirs:
+        # Pre-create every needed scaffold subdirectory upfront, in the main
+        # process, mirroring the single os.makedirs(args.output, ...) above --
+        # block-mode writes happen inside ProcessPoolExecutor workers, and
+        # nothing per-worker creates directories today, so doing this here
+        # avoids needing any cross-process race handling at write time.
+        for scaffold in {region["scaffold"] for region in regions}:
+            os.makedirs(os.path.join(args.output, scaffold), exist_ok=True)
+
     info_outfile = os.path.join(args.output, "maf_fetch_summary.tsv")
 
     # if args.fasta_header and not args.fasta:
@@ -1303,6 +1346,7 @@ def run_fetch(args, cmdline="mafutils fetch"):
             args.verbose,
             args.profile,
             prefetch_cache,
+            args.scaffold_subdirs,
         ),
     ) as executor, open(info_outfile, "w") as info_out:
         summary_headers = ["scaffold", "start", "end", "basename", "n.overlapping.blocks", "block.lengths", "interblock.distances", "n.sequences"]
@@ -1462,6 +1506,7 @@ def fetch_command(
     fasta_dedupe: Annotated[FastaDedupeMode, typer.Option("--fasta-dedupe", help="When outputting FASTA, collapse duplicate species per block; 'most-seq' keeps the copy with most non-gap bases.")] = FastaDedupeMode.none,
     processes: Annotated[int, typer.Option("--processes", "-p", help="Number of parallel processes to use (default: 1)")] = 1,
     mode: Annotated[FetchMode, typer.Option("--mode", "-m", help="Mode: 'block' to trim by regions, 'scaffold' to extract whole scaffolds (default: block)")] = FetchMode.block,
+    scaffold_subdirs: Annotated[bool, typer.Option("--scaffold-subdirs", help="Group output files into subfolders named by reference scaffold (<output>/<scaffold>/<basename>) instead of one flat directory.")] = False,
     single_output: Annotated[bool, typer.Option("--single-output", hidden=True)] = False,
     verbose: Annotated[bool, typer.Option("--verbose", help="Print every warning line after each batch completes.")] = False,
     profile: Annotated[bool, typer.Option("--profile", help="Log aggregate timing breakdowns for internal fetch steps.")] = False,
@@ -1480,6 +1525,7 @@ def fetch_command(
         fasta_dedupe=fasta_dedupe.value,
         processes=processes,
         mode=mode.value,
+        scaffold_subdirs=scaffold_subdirs,
         single_output=single_output,
         verbose=verbose,
         profile=profile,

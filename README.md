@@ -177,6 +177,7 @@ Options:
 | `--fasta-dedupe` | FASTA duplicate handling: `none` or `most-seq` |
 | `--processes`, `-p` | Number of worker processes (see Compression above — plain gzip always runs single-process) |
 | `--mode`, `-m` | Fetch mode: `block` or `scaffold` |
+| `--scaffold-subdirs` | Group output files into subfolders named by reference scaffold (`<output>/<scaffold>/<basename>`) instead of one flat directory |
 | `--verbose` | Emit warning lines from each completed batch |
 | `--profile` | Log internal timing breakdowns |
 | `--verify-hash` | Verify the index's stored content hash against the MAF file (see Index Integrity above) |
