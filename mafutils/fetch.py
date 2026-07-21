@@ -1075,8 +1075,15 @@ def fetchScaffoldsSequential(ordered_scaffolds, index, maf_file, maf_header, maf
 
 def run_fetch(args, cmdline="mafutils fetch"):
 
+    if not args.single_output:
+        os.makedirs(args.output, exist_ok=True);
+    # Create the output directory before deciding where the log goes -- the
+    # log path check below needs args.output to already exist, since that's
+    # the whole point of checking os.path.isdir() rather than just always
+    # joining onto it.
+
     logfilename = os.path.join(args.output, "maf_fetch.log") if os.path.isdir(args.output) else "maf_fetch.log"
-    maf_fetch_logger = LOGINIT.configureLogging(log_level="INFO", log_verbosity="BOTH", log_filename=logfilename, logger_name="maf_fetch_logger")
+    maf_fetch_logger = LOGINIT.configureLogging(log_level="INFO", log_verbosity="BOTH", log_filename=logfilename, logger_name="maf_fetch_logger", overwrite_log_file=True)
     LOG = logging.getLogger(maf_fetch_logger)
     # Set up logging
 
@@ -1105,9 +1112,6 @@ def run_fetch(args, cmdline="mafutils fetch"):
     if maf_compression not in ("none", "gz", "bgzip"):
         LOG.error(f"Unsupported MAF compression: {maf_compression}")
         sys.exit(1)
-    if not args.single_output:
-        os.makedirs(args.output, exist_ok=True);
-    # Create output directory if it doesn't exist
 
     index_file = args.index_file
     if index_file is None:

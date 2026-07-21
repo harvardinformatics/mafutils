@@ -13,7 +13,7 @@ It currently provides five commands:
 
 ## Disclaimer
 
-This project was developed with significant assistance from a large language model (GPT-5 / Codex).
+This project was developed with significant assistance from large language models (GPT-5 / Codex, Claude Sonnet).
 
 ## Third-Party Code
 
@@ -24,69 +24,62 @@ for full attribution and license text.
 
 ## Installation
 
-From this `mafutils/` directory:
-
 ```bash
-pip install -e .
+pip install mafutils
 ```
 
-If you are using the current shared workflow environment instead of a separate
-package environment, you can also run it directly with:
-
-```bash
-python -m mafutils --help
-```
+This installs the `mafutils` command.
 
 ## Quick Start
 
 Show top-level help:
 
 ```bash
-python -m mafutils --help
+mafutils --help
 ```
 
 Create block and scaffold indexes for a MAF (defaults to
 `input.maf.block.idx` / `input.maf.scaffold.idx` if output paths are omitted):
 
 ```bash
-python -m mafutils index input.maf
+mafutils index input.maf
 ```
 
 Fetch trimmed MAF regions from a BED file (index defaults to
 `input.maf.block.idx`):
 
 ```bash
-python -m mafutils fetch input.maf regions.bed -o outdir
+mafutils fetch input.maf regions.bed -o outdir
 ```
 
 Fetch FASTA output instead of MAF:
 
 ```bash
-python -m mafutils fetch input.maf regions.bed -o outdir -f -fh species-coords-id
+mafutils fetch input.maf regions.bed -o outdir -f -fh species-coords-id
 ```
 
 Extract full scaffolds using a scaffold index:
 
 ```bash
-python -m mafutils fetch input.maf scaffolds.bed -m scaffold -o outdir
+mafutils fetch input.maf scaffolds.bed -m scaffold -o outdir
 ```
 
 Summarize an indexed MAF:
 
 ```bash
-python -m mafutils stats input.maf -o summary/example
+mafutils stats input.maf -o summary/example
 ```
 
 Calculate per-species GC content:
 
 ```bash
-python -m mafutils gc input.maf -o summary/example
+mafutils gc input.maf -o summary/example
 ```
 
 Check whether an index is still trustworthy (see Index Integrity below):
 
 ```bash
-python -m mafutils validate input.maf
+mafutils validate input.maf
 ```
 
 ## Compression
@@ -102,13 +95,10 @@ python -m mafutils validate input.maf
 If you plan to use `--processes > 1` against compressed input, compress with
 `bgzip` rather than plain `gzip` to get real parallel speedup.
 
-**No extra dependency for bgzip:** BGZF support is provided by
-`mafutils/lib/bgzf.py`, vendored from [Biopython](https://biopython.org/)
-(see the notice at the top of that file and `THIRD_PARTY_LICENSES.md`) rather
-than by depending on the `biopython` package, which would otherwise pull in
-`numpy` for no other reason. This does mean upstream bug fixes to that file
-aren't picked up automatically — see `DEVELOPMENT.md` if you're debugging a
-bgzip-related issue.
+**No extra dependency for bgzip:** BGZF support is vendored in
+`mafutils/lib/bgzf.py` rather than depending on the `biopython` package —
+see `DEVELOPMENT.md` for why, and [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md)
+for attribution.
 
 ## Index Integrity
 
@@ -147,7 +137,7 @@ For a "check once, trust thereafter" workflow instead of passing
 Create block and scaffold indexes for a MAF file.
 
 ```bash
-python -m mafutils index MAF_FILE [BLOCK_INDEX] [SCAFFOLD_INDEX]
+mafutils index MAF_FILE [BLOCK_INDEX] [SCAFFOLD_INDEX]
 ```
 
 Arguments:
@@ -163,7 +153,7 @@ Arguments:
 Fetch regions or scaffolds from a MAF using an existing index.
 
 ```bash
-python -m mafutils fetch [OPTIONS] MAF_FILE BED_FILE
+mafutils fetch [OPTIONS] MAF_FILE BED_FILE
 ```
 
 Arguments:
@@ -202,7 +192,7 @@ file) order, and decodes shared blocks only once even when regions overlap.
 Summarize an indexed MAF at overall, species, and block levels.
 
 ```bash
-python -m mafutils stats [OPTIONS] MAF_FILE [INDEX_FILE]
+mafutils stats [OPTIONS] MAF_FILE [INDEX_FILE]
 ```
 
 Arguments:
@@ -239,7 +229,7 @@ GC is computed as `(G+C) / (A+C+G+T)`, case-insensitive; gaps, `N`, and other
 ambiguity codes are excluded from both the numerator and denominator.
 
 ```bash
-python -m mafutils gc MAF_FILE [INDEX_FILE] [OPTIONS]
+mafutils gc MAF_FILE [INDEX_FILE] [OPTIONS]
 ```
 
 Arguments:
@@ -292,7 +282,7 @@ two indexes weren't built together (e.g. only one was rebuilt) and
 shouldn't be trusted as a matched pair.
 
 ```bash
-python -m mafutils validate MAF_FILE [INDEX_FILE]
+mafutils validate MAF_FILE [INDEX_FILE]
 ```
 
 Arguments:
@@ -312,23 +302,7 @@ verdict. Exit codes:
 | `1` | MISMATCH | A conclusive difference was found (compression, size, or hash against the MAF file; or the block and scaffold index headers disagree) — rebuild the index(es). |
 | `2` | UNVERIFIABLE | Nothing contradicts, but there's no stored hash to be fully sure (the index predates this feature), or the scaffold index is missing/headerless so the pair couldn't be cross-checked. |
 
-## Testing
-
-From inside this `mafutils/` directory:
-
-```bash
-pytest tests/
-```
-
-`tests/test_compression.py` covers cross-cutting compression behavior
-(bgzip/gzip detection, index headers, index auto-derivation, and the
-per-command parallel/sequential/fallback logic described above) across all
-three compression types. `tests/test_validate.py` covers index integrity
-(size/mtime/hash header fields, `mafutils validate`'s three-way verdict, and
-`--verify-hash` on `fetch`/`stats`/`gc`).
-
 ## Notes
 
-- `python -m mafutils ...` is the supported invocation from a source checkout.
-- The installed console entrypoint is `mafutils ...` once the package is
-  installed.
+For development setup (installing from a source checkout), running the test
+suite, and internal implementation notes, see [`DEVELOPMENT.md`](DEVELOPMENT.md).

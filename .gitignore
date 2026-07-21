@@ -10,3 +10,6 @@ data/
 benchmarks/results/
 benchmarks/summary.html
 benchmarks/.snakemake/
+
+# Stray runtime log mafutils fetch writes to its output dir by default.
+maf_fetch.log

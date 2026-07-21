@@ -1,5 +1,9 @@
 # mafutils Development Notes
 
+Internal implementation notes, gotchas, and maintainer workflows (testing,
+releasing) for developing `mafutils` itself — see [`README.md`](README.md)
+for user-facing installation/usage docs.
+
 - `tests/example.maf.scaffold.idx` is preserved as an older, headerless
   scaffold-index fixture for comparison — it deliberately sits at
   `example.maf`'s *default* scaffold-index path
@@ -154,6 +158,36 @@
   (`prefetchBlockCache`/`WORKER_BLOCK_CACHE`), which sidesteps
   backward-seek risk entirely rather than relying on any per-region
   processing order.
+
+## Development setup
+
+From a source checkout, an editable install picks up code changes without
+reinstalling:
+
+```bash
+pip install -e .
+```
+
+Or run directly against the checkout without installing at all:
+
+```bash
+python -m mafutils --help
+```
+
+## Testing
+
+From inside this `mafutils/` directory:
+
+```bash
+pytest tests/
+```
+
+`tests/test_compression.py` covers cross-cutting compression behavior
+(bgzip/gzip detection, index headers, index auto-derivation, and the
+per-command parallel/sequential/fallback logic) across all three compression
+types. `tests/test_validate.py` covers index integrity (size/mtime/hash
+header fields, `mafutils validate`'s three-way verdict, and `--verify-hash`
+on `fetch`/`stats`/`gc`).
 
 ## Releasing to PyPI
 
