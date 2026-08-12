@@ -143,6 +143,31 @@ for user-facing installation/usage docs.
   `benchmark:` reports as a sum across the process tree). So gz costs more time
   *and* more peak memory than the parallel-eligible compressions for the same
   `fetch` workload — worth knowing before running it on a memory-constrained node.
+- **`mafutils index`'s hot loop: `TextIOWrapper.tell()` was the bottleneck, and
+  the fix is binary mode + a byte counter, NOT a chunked scanner.** Profiling a
+  real 1.5GB MAF slice showed `tell()` at ~60% of runtime — it was called once
+  per line (`iterMafBlocks` needs a position before every line) and cost ~4.6x
+  more than the `readline()` it accompanied, because on a `TextIOWrapper`
+  `tell()` must snapshot the incremental UTF-8 decoder state to build a
+  seekable cookie (visible as ~1.1M `codecs.getstate`/`setstate` calls). Since
+  `none`/`gz` have plain additive stream positions, `iterMafBlocks(...,
+  binary=True)` now reads a binary stream and tracks position with `pos +=
+  len(line)`. Measured on 1.5GB of real data, scan-only: **11.89s -> 1.38s
+  (8.6x)**; end-to-end `mafutils index`: **23.82s -> 11.63s (2.05x)**, output
+  byte-identical.
+  Two approaches that sound faster but measured **slower**, so don't retry them
+  without new evidence: a chunked `bytes.find(b"\n")` scanner (2.17s — loses to
+  C-implemented `BufferedReader.readline()` while adding Python-level buffer
+  slicing), and a block-level scanner that finds `b"\na"` boundaries to avoid
+  per-line iteration entirely (2.71s — still has to walk every line to count
+  non-blank lines for `num_seqs`, plus buffer-concatenation cost). Remaining
+  headroom is real but modest: end-to-end sits at ~129 MB/s against a ~640 MB/s
+  ceiling (raw read + MD5 with no parsing at all), and closing it would require
+  assuming things about intra-block blank/comment lines that risk silently
+  corrupting an index.
+  **bgzip deliberately stays on the text+`tell()` path** — its virtual offsets
+  are not additive, so a byte counter cannot reproduce them (same root cause as
+  the straddling-`a`-line bug above).
 - The vendored `bgzf.BgzfReader` has no `.name` attribute (unlike `gzip.GzipFile`),
   so `fetch.py` gets the MAF's display filename from the known `maf_file`
   path (`WORKER_MAF_FILE`), not from the open file handle.

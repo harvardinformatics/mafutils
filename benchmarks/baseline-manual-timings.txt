@@ -3,6 +3,12 @@ real 197.77
 user 185.05
 sys 11.46
 
+time -p mafutils index cricetid-15spec.Mus_musculus.nodupes.maf
+real 122.69
+user 110.87
+sys 10.13
+
+
 time -p mafutils validate cricetid-15spec.Mus_musculus.nodupes.maf
 [ 2026-07-17 12:36:33 - INFO ] mafutils validate called as: mafutils validate cricetid-15spec.Mus_musculus.nodupes.maf
 [ 2026-07-17 12:36:33 - INFO ] Using index at default location: cricetid-15spec.Mus_musculus.nodupes.maf.block.idx
@@ -125,6 +131,11 @@ real 685.60
 user 680.49
 sys 2.38
 
+time -p mafutils index cricetid-15spec.Mus_musculus.nodupes.maf.gz
+real 182.47
+user 178.17
+sys 2.30
+
 time -p mafutils validate cricetid-15spec.Mus_musculus.nodupes.maf.gz
 [ 2026-07-17 15:48:42 - INFO ] mafutils validate called as: mafutils validate cricetid-15spec.Mus_musculus.nodupes.maf.gz
 [ 2026-07-17 15:48:42 - INFO ] Using index at default location: cricetid-15spec.Mus_musculus.nodupes.maf.gz.block.idx
@@ -232,6 +243,13 @@ time -p mafutils index cricetid-15spec.Mus_musculus.nodupes.maf.gz
 real 255.30
 user 251.65
 sys 2.53
+
+time -p mafutils index cricetid-15spec.Mus_musculus.nodupes.maf.gz
+
+real 224.75
+user 219.95
+sys 2.93
+
 
 time -p mafutils validate cricetid-15spec.Mus_musculus.nodupes.maf.gz
 [ 2026-07-17 15:53:14 - INFO ] mafutils validate called as: mafutils validate cricetid-15spec.Mus_musculus.nodupes.maf.gz
