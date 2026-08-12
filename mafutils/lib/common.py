@@ -148,16 +148,31 @@ def openMafHashing(filename, compression, hash_obj):
     """
     Like openMaf(), but threads a _HashingRawIO underneath the reader so
     every byte read from disk is fed into hash_obj -- for gz/bgzip this
-    means hashing the raw compressed bytes, before decompression. Returns a
-    stream with the same .readline()/.tell() interface iterMafBlocks()
-    expects. Used only by mafutils index.
+    means hashing the raw compressed bytes, before decompression. Used only
+    by mafutils index.
+
+    For "none"/"gz" this returns a BINARY stream, to be consumed by
+    iterMafBlocks(..., binary=True): those two compression types have plain
+    additive stream positions, so byte offsets can be tracked with a simple
+    counter instead of calling tell(). That matters enormously at scale --
+    on a TextIOWrapper, tell() must snapshot the incremental UTF-8 decoder's
+    state to build a seekable cookie, making it ~4.6x more expensive than
+    the readline() it accompanies, and iterMafBlocks needs a position before
+    every single line. Measured on a 1.5GB real MAF: 11.89s (text+tell) vs
+    1.38s (binary+counting) for the same, byte-identical offsets.
+
+    For "bgzip" this still returns a TEXT stream, because BGZF virtual
+    offsets pack a compressed-block offset and an in-block offset into one
+    int -- they are NOT additive, so a byte counter cannot reproduce them
+    and tell() is genuinely required. See iterMafBlocks for the full
+    explanation.
     """
     hashing_raw = _HashingRawIO(open(filename, "rb"), hash_obj)
 
     if compression == "none":
-        return io.TextIOWrapper(hashing_raw)
+        return io.BufferedReader(hashing_raw)
     elif compression == "gz":
-        return io.TextIOWrapper(gzip.GzipFile(fileobj=hashing_raw, mode="rb"))
+        return io.BufferedReader(gzip.GzipFile(fileobj=hashing_raw, mode="rb"))
     elif compression == "bgzip":
         return bgzf.BgzfReader(fileobj=hashing_raw, mode="rt")
     else:
@@ -391,52 +406,82 @@ def validateIndexHeader(header, maf_file, detected_compression, LOG, strict=Fals
 
 #############################################################################
 
-def iterMafBlocks(stream):
+def iterMafBlocks(stream, binary=False):
     """
-    Splits an open MAF stream into raw per-block text, split on 'a'-prefixed
+    Splits an open MAF stream into raw per-block lines, split on 'a'-prefixed
     header lines (skipping blank/comment lines). Yields
-    (block_text, block_start_offset, block_end_offset) tuples, where the
-    offsets are raw stream.tell() positions bracketing each block, suitable
-    for later random-access seeking back into the same file.
+    (block_lines, block_start_offset, block_end_offset) tuples, where the
+    offsets bracket each block and are suitable for later random-access
+    seeking back into the same file.
 
-    Never computes a boundary by arithmetic on a tell() value (e.g.
-    tell() - len(line)) -- only ever uses tell() values exactly as the
-    stream reports them, captured at the right moment (before reading the
-    line that starts a new block). This matters for BGZF: its virtual
-    offsets pack a compressed-block-offset and an in-block-offset into one
-    int, and subtracting a plain byte count from that packed value can
-    "borrow" across the packing whenever an 'a' line straddles a real BGZF
-    block boundary, landing on a byte position that was never a valid block
-    start (confirmed against a real ~114k-block file, where this corrupted
-    the offset by exactly the size of that borrow). Capturing tell()
-    upfront sidesteps the packed representation entirely, and is exactly as
-    correct for the simpler none/gz cases too.
+    block_lines[0] (the 'a' header) and block_lines[1] (the reference/first
+    sequence line) are always returned as stripped `str` -- they are the
+    only two lines whose *content* mafutils index reads. The remaining
+    sequence lines are returned exactly as readline() produced them, and in
+    binary mode are still `bytes`: only their *count* (len(block_lines)) is
+    ever used downstream, so decoding/stripping them would be pure overhead.
+    That matters enormously at scale -- a block can carry hundreds of
+    sequence lines (one per species) and a whole-genome MAF hundreds of
+    millions of blocks.
+
+    Two position-tracking modes, because the two cases are fundamentally
+    different:
+
+    binary=True (for "none"/"gz", via openMafHashing): the stream is binary
+    and positions are tracked with a plain additive byte counter. Valid
+    because both have simple additive stream positions (raw file bytes, and
+    decompressed-stream bytes, respectively). This exists for speed: on a
+    TextIOWrapper, tell() must snapshot the incremental UTF-8 decoder state
+    to build a seekable cookie, costing ~4.6x more than the readline() it
+    accompanies -- and a position is needed before every single line.
+    Measured on a 1.5GB real MAF: 11.89s (text+tell) vs 1.38s
+    (binary+counting), producing byte-identical offsets over 269,308 blocks.
+
+    binary=False (for "bgzip"): positions come from stream.tell() and are
+    NEVER derived by arithmetic (e.g. tell() - len(line)). BGZF virtual
+    offsets pack a compressed-block offset and an in-block offset into one
+    int, so they are not additive -- subtracting or adding a plain byte
+    count can "borrow" across the packing whenever an 'a' line straddles a
+    real BGZF block boundary, landing on a byte position that was never a
+    valid block start (confirmed against a real ~114k-block file, where it
+    corrupted the offset by exactly the size of that borrow). This is also
+    why the binary counting path above must not be used for bgzip.
     """
+    if binary:
+        empty, hash_prefix, a_prefix = b"", b"#", b"a"
+    else:
+        empty, hash_prefix, a_prefix = "", "#", "a"
+
     block_lines = []
     block_start = None
-    pos = stream.tell()
+    pos = 0 if binary else stream.tell()
+    next_line_is_reference = False
 
     while True:
         line = stream.readline()
-        if line == "":
+        if line == empty:
             break
-        next_pos = stream.tell()
+        next_pos = pos + len(line) if binary else stream.tell()
 
-        if line.startswith("#") or line.strip() == "":
+        if line.startswith(hash_prefix) or not line.strip():
             pos = next_pos
             continue
 
-        if line.startswith("a"):
+        if line.startswith(a_prefix):
             if block_lines:
-                yield "\n".join(block_lines), block_start, pos
+                yield block_lines, block_start, pos
             block_start = pos
-            block_lines = [line.strip()]
+            block_lines = [line.decode().strip() if binary else line.strip()]
+            next_line_is_reference = True
+        elif next_line_is_reference:
+            block_lines.append(line.decode().strip() if binary else line.strip())
+            next_line_is_reference = False
         else:
-            block_lines.append(line.strip())
+            block_lines.append(line)
 
         pos = next_pos
 
     if block_lines:
-        yield "\n".join(block_lines), block_start, stream.tell()
+        yield block_lines, block_start, pos if binary else stream.tell()
 
 #############################################################################

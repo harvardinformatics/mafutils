@@ -19,11 +19,10 @@ from mafutils.lib import common as COMMON
 def process_maf_block(block):
     ref_seq = block[1].split()
     ref_scaff = ref_seq[1].split(".", 1)[1]
-    ref_len = block[1].split()[3]
     line_len = str(len(block[1]))
     num_seqs = str(len(block) - 1)
     seq_len = str(len(ref_seq[6]))
-    return [ref_scaff, ref_seq[2], ref_len, seq_len, line_len, num_seqs]
+    return [ref_scaff, ref_seq[2], ref_seq[3], seq_len, line_len, num_seqs]
 
 
 def run_index(maf_file, block_index_path, scaffold_index_path):
@@ -48,8 +47,12 @@ def run_index(maf_file, block_index_path, scaffold_index_path):
             region_start_byte = None
             region_end_byte = None
 
-            for block_text, block_start, block_end in COMMON.iterMafBlocks(maf_stream):
-                block = block_text.split("\n")
+            # none/gz get the fast binary+byte-counting path; bgzip must use
+            # text mode + tell(), since its virtual offsets aren't additive
+            # (see iterMafBlocks/openMafHashing).
+            use_binary = maf_compression in ("none", "gz")
+
+            for block, block_start, block_end in COMMON.iterMafBlocks(maf_stream, binary=use_binary):
                 block_info = process_maf_block(block)
                 ref_scaffold = block_info[0]
 
