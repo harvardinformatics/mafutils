@@ -38,6 +38,12 @@ Show top-level help:
 mafutils --help
 ```
 
+Show the installed version:
+
+```bash
+mafutils --version    # also accepts -version, -v, -V
+```
+
 Create block and scaffold indexes for a MAF (defaults to
 `input.maf.block.idx` / `input.maf.scaffold.idx` if output paths are omitted):
 

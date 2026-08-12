@@ -1,5 +1,8 @@
+from typing import Annotated
+
 import typer
 
+from . import __version__
 from . import fetch as fetch_mod
 from . import gc as gc_mod
 from . import index as index_mod
@@ -18,6 +21,32 @@ app.command("gc", help="Calculate per-species GC content from a MAF file.")(gc_m
 app.command("index", help="Create block and scaffold indexes for a MAF file.")(index_mod.index_command)
 app.command("stats", help="Summarize an indexed MAF at overall, species, and block levels.")(stats_mod.stats_command)
 app.command("validate", help="Check whether a MAF file's index is still trustworthy.")(validate_mod.validate_command)
+
+
+def versionCallback(value: bool) -> None:
+    if value:
+        typer.echo(f"mafutils {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def mafutils_callback(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            "-version",
+            "-v",
+            "-V",
+            callback=versionCallback,
+            is_eager=True,
+            help="Show the installed mafutils version and exit.",
+        ),
+    ] = False,
+) -> None:
+    # is_eager so --version is handled before any subcommand parsing, letting
+    # `mafutils --version` work on its own without a subcommand.
+    pass
 
 
 def main() -> None:
