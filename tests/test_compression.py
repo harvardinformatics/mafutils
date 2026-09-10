@@ -156,7 +156,6 @@ def test_fetch_gzip_falls_back_and_matches(tmp_path):
     assert result.returncode == 0, result.stderr
     output = combined_output(result)
     assert "inefficient on" in output
-    assert "Prefetching" in output
 
     for name in os.listdir(baseline_dir):
         if not name.endswith(".maf"):

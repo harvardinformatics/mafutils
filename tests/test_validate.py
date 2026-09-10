@@ -14,10 +14,25 @@ REPO_ROOT = os.path.abspath(os.path.join(TEST_DIR, ".."))
 MAF_FILE = os.path.join(TEST_DIR, "example.maf")
 INDEX_FILE = os.path.join(TEST_DIR, "example.maf.block.idx")
 
-# Deliberately preserved pre-hash-header fixture (see DEVELOPMENT.md) -- used
-# directly as a "headerless for these fields" case rather than constructing
-# one by hand.
-HEADERLESS_SCAFFOLD_INDEX = os.path.join(TEST_DIR, "example.maf.scaffold.idx")
+
+def writeHeaderlessIndex(src_index, dst_path):
+    """
+    Copies an index without its `# mafutils-index ...` header line, i.e. what
+    an index built by a pre-header mafutils version looks like.
+
+    Built here rather than relying on a committed stale fixture: that made the
+    file's out-of-date-ness load-bearing but invisible, so regenerating it (as
+    the block-index streaming work required) silently changed what these tests
+    exercised. Mirrors how
+    test_verify_hash_errors_when_header_present_but_no_hash_field constructs
+    its own sibling case.
+    """
+    with open(src_index) as src, open(dst_path, "w") as dst:
+        for line in src:
+            if line.startswith("# mafutils-index"):
+                continue
+            dst.write(line)
+    return dst_path
 
 
 def run_module(args, cwd=REPO_ROOT):
@@ -58,12 +73,9 @@ def test_hash_is_reproducible(tmp_path):
 
 
 def test_validate_clean_match_exits_0(tmp_path):
-    # A freshly-built block+scaffold pair, unlike the checked-in MAF_FILE
-    # fixture whose default-path scaffold index is deliberately kept
-    # headerless (see HEADERLESS_SCAFFOLD_INDEX above) to exercise that path
-    # elsewhere -- that fixture would (correctly) make this case
-    # UNVERIFIABLE rather than VERIFIED, since it can't cross-check a
-    # headerless scaffold index.
+    # Build a fresh block+scaffold pair in tmp_path rather than reusing the
+    # checked-in fixtures, so this asserts on a pair that is definitionally
+    # consistent with each other and with the MAF.
     maf_copy = os.path.join(str(tmp_path), "clean.maf")
     shutil.copyfile(MAF_FILE, maf_copy)
     index_result = run_module(["index", maf_copy])
@@ -142,7 +154,8 @@ def test_validate_content_change_exits_1(tmp_path):
 
 
 def test_validate_headerless_index_exits_2(tmp_path):
-    result = run_module(["validate", MAF_FILE, HEADERLESS_SCAFFOLD_INDEX])
+    headerless = writeHeaderlessIndex(INDEX_FILE, os.path.join(str(tmp_path), "headerless.block.idx"))
+    result = run_module(["validate", MAF_FILE, headerless])
     assert result.returncode == 2, combined_output(result)
     assert "UNVERIFIABLE" in combined_output(result)
 
@@ -178,9 +191,10 @@ def test_fetch_verify_hash_errors_on_fully_headerless_index(tmp_path):
     with open(bed_path, "w") as fp:
         fp.write("chr1\t0\t10\tregion1\n")
 
+    headerless = writeHeaderlessIndex(INDEX_FILE, os.path.join(str(tmp_path), "headerless.block.idx"))
     result = run_module([
         "fetch", MAF_FILE, bed_path,
-        "--index", HEADERLESS_SCAFFOLD_INDEX,
+        "--index", headerless,
         "--verify-hash",
         "-o", os.path.join(str(tmp_path), "out"),
     ])

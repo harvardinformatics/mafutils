@@ -35,7 +35,8 @@ from enum import Enum
 from types import SimpleNamespace
 from typing import Annotated, Optional
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from itertools import islice
 
 import typer
 
@@ -75,8 +76,24 @@ def parseExpectedSpecies(args):
     return species
 
 
-def parseIndex(index_file, LOG):
-    entries = []
+def iterIndexEntries(index_file, LOG):
+    """
+    Streams one tuple per block from the block index.
+
+    A generator rather than a list on purpose: a whole-genome index has on
+    the order of 233M block records, and materializing them (as mafutils gc
+    used to do, with only 2 fields per block rather than the 8 here) measured
+    ~32GB of RAM and OOM-killed the run before any work happened. See
+    DEVELOPMENT.md.
+
+    block_id numbering deliberately matches the previous list-building
+    version bit for bit, including its quirk: the counter is incremented
+    *before* the int() conversions, so a line that has enough fields but
+    fails to parse still consumes an id (leaving a gap in block_id) rather
+    than renumbering everything after it. Only matters for malformed
+    indexes, but block_id is written into the per-block output table, so
+    changing it would silently change that output.
+    """
     with open(index_file, "r", encoding="utf-8") as fp:
         block_id = 0
         for line in fp:
@@ -88,26 +105,33 @@ def parseIndex(index_file, LOG):
                 continue
             try:
                 block_id += 1
-                entries.append(
-                    (
-                        block_id,
-                        fields[0],  # scaffold
-                        int(fields[1]),  # ref_start
-                        int(fields[2]),  # ref_length
-                        int(fields[3]),  # aln_length
-                        int(fields[5]),  # n_seq_lines (index)
-                        int(fields[6]),  # offset_start
-                        int(fields[7]),  # offset_end
-                    )
+                entry = (
+                    block_id,
+                    fields[0],  # scaffold
+                    int(fields[1]),  # ref_start
+                    int(fields[2]),  # ref_length
+                    int(fields[3]),  # aln_length
+                    int(fields[5]),  # n_seq_lines (index)
+                    int(fields[6]),  # offset_start
+                    int(fields[7]),  # offset_end
                 )
             except ValueError:
                 LOG.warning(f"Skipping malformed index line: {line.strip()}")
-    return entries
+                continue
+            yield entry
 
 
-def chunker(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
+def chunker(iterable, size):
+    """
+    Yields lists of up to `size` items from any iterable, pulling lazily via
+    islice so a generator source is never materialized.
+    """
+    iterator = iter(iterable)
+    while True:
+        chunk = list(islice(iterator, size))
+        if not chunk:
+            return
+        yield chunk
 
 
 def speciesFromSrc(src):
@@ -211,7 +235,19 @@ def workerTask(
     entries,
     write_block_rows,
     tmp_dir,
+    maf_fp=None,
 ):
+    """
+    Processes one chunk of index entries.
+
+    maf_fp lets a caller supply an already-open handle to reuse across
+    chunks. That matters for the single-process path: entries are in
+    ascending file order, so reusing one handle keeps every seek forward.
+    Reopening per chunk would restart gzip decompression from byte 0 each
+    time, turning the sequential gz path quadratic once the index is
+    streamed in many chunks rather than handed over as one giant chunk.
+    Parallel workers pass nothing and open their own handle, as before.
+    """
     overall = {
         "total_blocks": 0,
         "total_alignment_columns": 0,
@@ -249,7 +285,10 @@ def workerTask(
         block_tmp_path = os.path.join(tmp_dir, f"maf_stats.blocks.task{task_id}.tsv")
         block_tmp = open(block_tmp_path, "w", encoding="utf-8")
 
-    with COMMON.openMaf(maf_file, maf_compression, "rb") as maf_fp:
+    owns_handle = maf_fp is None
+    if owns_handle:
+        maf_fp = COMMON.openMaf(maf_file, maf_compression, "rb")
+    try:
         for entry in entries:
             (
                 block_id,
@@ -322,11 +361,15 @@ def workerTask(
                     )
                     + "\n"
                 )
+    finally:
+        if owns_handle:
+            maf_fp.close()
 
     if block_tmp is not None:
         block_tmp.close()
 
     return {
+        "task_id": task_id,
         "overall": overall,
         "species": dict(species),
         "observed_species": sorted(observed_species),
@@ -334,41 +377,54 @@ def workerTask(
     }
 
 
-def mergeStats(results):
-    overall = defaultdict(float)
-    species = defaultdict(
-        lambda: {
-            "blocks_present": 0,
-            "copy_lines": 0,
-            "duplicated_blocks": 0,
-            "duplicate_copies_total": 0,
-            "gaps_total": 0,
-            "nongaps_total": 0,
-            "gap_pct_block_sum": 0.0,
-            "all_gap_blocks": 0,
-        }
-    )
-    observed_species = set()
-    block_tmp_paths = []
+def newStatsAccumulator():
+    """
+    Fresh accumulator for merging worker results one at a time. Paired with
+    mergeStatsInto() so each chunk's result can be folded in and dropped as
+    it arrives -- holding every chunk's result to merge at the end would
+    scale with index size (a whole-genome run is ~47k chunks, each carrying
+    a per-species dict).
+    """
+    return {
+        "overall": defaultdict(float),
+        "species": defaultdict(
+            lambda: {
+                "blocks_present": 0,
+                "copy_lines": 0,
+                "duplicated_blocks": 0,
+                "duplicate_copies_total": 0,
+                "gaps_total": 0,
+                "nongaps_total": 0,
+                "gap_pct_block_sum": 0.0,
+                "all_gap_blocks": 0,
+            }
+        ),
+        "observed_species": set(),
+        "block_tmp_paths": [],
+    }
 
-    for res in results:
-        for k, v in res["overall"].items():
-            if k == "site_gap_hist":
-                if "site_gap_hist" not in overall:
-                    overall["site_gap_hist"] = [0] * (SITE_GAP_HIST_BINS + 1)
-                for i, count in enumerate(v):
-                    overall["site_gap_hist"][i] += count
-            else:
-                overall[k] += v
-        for sp, rec in res["species"].items():
-            s = species[sp]
-            for k, v in rec.items():
-                s[k] += v
-        observed_species.update(res["observed_species"])
-        if res["block_tmp_path"]:
-            block_tmp_paths.append(res["block_tmp_path"])
 
-    return overall, species, observed_species, block_tmp_paths
+def mergeStatsInto(acc, res):
+    overall = acc["overall"]
+    for k, v in res["overall"].items():
+        if k == "site_gap_hist":
+            if "site_gap_hist" not in overall:
+                overall["site_gap_hist"] = [0] * (SITE_GAP_HIST_BINS + 1)
+            for i, count in enumerate(v):
+                overall["site_gap_hist"][i] += count
+        else:
+            overall[k] += v
+    for sp, rec in res["species"].items():
+        s = acc["species"][sp]
+        for k, v in rec.items():
+            s[k] += v
+    acc["observed_species"].update(res["observed_species"])
+    if res["block_tmp_path"]:
+        # Keyed by task_id so the per-chunk block rows can be concatenated in
+        # index order. Results arrive out of order in the parallel path, and
+        # sorting by *filename* is wrong regardless: "task10" sorts before
+        # "task2", which scrambled block.tsv for any run with >=10 chunks.
+        acc["block_tmp_paths"].append((res["task_id"], res["block_tmp_path"]))
 
 
 def writeOverall(out_path, overall, n_species_total):
@@ -478,7 +534,10 @@ def writeBlockTable(out_path, block_tmp_paths, n_species_total, expected_species
     with open(out_path, "w", encoding="utf-8") as out_fp:
         out_fp.write("\t".join(header) + "\n")
 
-        for tmp_path in sorted(block_tmp_paths):
+        # Already ordered by task id (= index order) by the caller; do NOT
+        # sort by path here -- filenames sort lexicographically, so "task10"
+        # would land before "task2".
+        for tmp_path in block_tmp_paths:
             with open(tmp_path, "r", encoding="utf-8") as in_fp:
                 for line in in_fp:
                     fields = line.rstrip("\n").split("\t")
@@ -1188,13 +1247,8 @@ def run_stats(args, cmdline="mafutils stats"):
     if expected_species:
         LOG.info(f"Loaded {len(expected_species)} expected species for exact missing-species reporting.")
 
-    LOG.info(f"Parsing index file: {index_file}")
+    LOG.info(f"Reading index file: {index_file}")
     COMMON.validateIndexHeader(COMMON.readIndexHeader(index_file), args.maf_file, maf_compression, LOG, strict=args.verify_hash)
-    entries = parseIndex(index_file, LOG)
-    if not entries:
-        LOG.error("No valid index entries found.")
-        sys.exit(1)
-    LOG.info(f"Loaded {len(entries)} indexed blocks.")
 
     effective_processes = args.processes
     effective_chunk_size = args.chunk_size
@@ -1206,22 +1260,32 @@ def run_stats(args, cmdline="mafutils stats"):
                 "for real parallel speedup on compressed input.)"
             )
         effective_processes = 1
-        effective_chunk_size = len(entries)
-        # A single task covering every entry, in one worker: since entries are
-        # already in ascending file order, this keeps gzip seeking strictly
-        # forward (cheap) instead of paying a redundant-decompression cost
-        # per additional worker/chunk.
+        # gz previously forced a single chunk covering every entry, to keep
+        # one worker seeking strictly forward. That required knowing the
+        # total entry count upfront, which is exactly what streaming avoids.
+        # The single-process path below now reuses one open handle across
+        # chunks instead, which preserves forward-only seeking without
+        # materializing the index.
 
-    chunks = list(chunker(entries, effective_chunk_size))
-    LOG.info(f"Running {len(chunks)} tasks with chunk size {effective_chunk_size} across {effective_processes} process(es).")
+    LOG.info(f"Streaming index in chunks of {effective_chunk_size} blocks across {effective_processes} process(es).")
 
     write_block_rows = (not args.no_block_table) or args.html_dashboard
     with tempfile.TemporaryDirectory(prefix="maf_stats_tmp_", dir=out_dir) as tmp_dir:
-        results = []
+        acc = newStatsAccumulator()
+        total_blocks_seen = 0
+        tasks_done = 0
+        # The index is streamed, never materialized -- see iterIndexEntries.
+        chunk_iter = enumerate(chunker(iterIndexEntries(index_file, LOG), effective_chunk_size), start=1)
+
         if effective_processes > 1:
+            # Bound in-flight work and merge results as they arrive, so peak
+            # memory is one accumulator plus the queued chunks rather than
+            # every chunk and every chunk's result.
+            max_in_flight = effective_processes * 2
             with ProcessPoolExecutor(max_workers=effective_processes) as executor:
-                futures = [
-                    executor.submit(
+                in_flight = {}
+                for task_id, chunk in chunk_iter:
+                    future = executor.submit(
                         workerTask,
                         task_id,
                         args.maf_file,
@@ -1230,10 +1294,17 @@ def run_stats(args, cmdline="mafutils stats"):
                         write_block_rows,
                         tmp_dir,
                     )
-                    for task_id, chunk in enumerate(chunks, start=1)
-                ]
-                for f in futures:
-                    results.append(f.result())
+                    in_flight[future] = len(chunk)
+                    if len(in_flight) < max_in_flight:
+                        continue
+                    done, _pending = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
+                    for f in done:
+                        total_blocks_seen += in_flight.pop(f)
+                        mergeStatsInto(acc, f.result())
+                        tasks_done += 1
+                for f in list(in_flight):
+                    total_blocks_seen += in_flight.pop(f)
+                    mergeStatsInto(acc, f.result())
         else:
             # Skip ProcessPoolExecutor entirely at processes=1 -- pool
             # creation carries a large, mostly-fixed memory cost regardless
@@ -1243,12 +1314,35 @@ def run_stats(args, cmdline="mafutils stats"):
             # in-process anyway. workerTask is a plain function with no
             # pool-initializer dependency, so calling it directly here is
             # equivalent to submitting it to a 1-worker pool.
-            for task_id, chunk in enumerate(chunks, start=1):
-                results.append(
-                    workerTask(task_id, args.maf_file, maf_compression, chunk, write_block_rows, tmp_dir)
-                )
+            #
+            # One handle is opened here and reused for every chunk: entries
+            # are in ascending file order, so all seeks stay forward. This is
+            # what preserves the cheap gz path now that the index arrives in
+            # many chunks instead of one -- reopening per chunk would restart
+            # gzip decompression from byte 0 each time.
+            with COMMON.openMaf(args.maf_file, maf_compression, "rb") as shared_fp:
+                for task_id, chunk in chunk_iter:
+                    total_blocks_seen += len(chunk)
+                    tasks_done += 1
+                    mergeStatsInto(
+                        acc,
+                        workerTask(
+                            task_id, args.maf_file, maf_compression, chunk,
+                            write_block_rows, tmp_dir, maf_fp=shared_fp,
+                        ),
+                    )
 
-        overall, species, observed_species, block_tmp_paths = mergeStats(results)
+        if not total_blocks_seen:
+            LOG.error("No valid index entries found.")
+            sys.exit(1)
+        LOG.info(f"Processed {total_blocks_seen} indexed blocks in {tasks_done} tasks.")
+
+        overall = acc["overall"]
+        species = acc["species"]
+        observed_species = acc["observed_species"]
+        # Sort numerically by task id so block rows land in index order
+        # regardless of which worker finished first.
+        block_tmp_paths = [path for _task_id, path in sorted(acc["block_tmp_paths"])]
 
         zero_seq_blocks = int(overall["blocks_with_zero_parsed_seq_lines_but_index_nonzero"])
         if zero_seq_blocks:

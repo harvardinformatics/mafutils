@@ -1,6 +1,7 @@
-chr1	16	264
-chr2	264	339
-chr3	339	483
-chr4	483	629
-chrX	629	701
-chr4	701	777
+# mafutils-index format=2 maf=example.maf compression=none size=776 mtime=1757533321.0 hash=md5:0c80ee622a5f9e5ef29d331e18278884
+chr1	16	263
+chr2	263	338
+chr3	338	482
+chr4	482	628
+chrX	628	700
+chr4	700	776
