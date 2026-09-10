@@ -41,7 +41,8 @@ import logging
 import os
 import sys
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from itertools import islice
 from enum import Enum
 from types import SimpleNamespace
 from typing import Annotated, Optional
@@ -105,12 +106,19 @@ def updateCountsFromSeqLine(line, counts):
 #############################################################################
 
 
-def parseIndex(index_file, LOG):
+def iterIndexEntries(index_file, LOG):
     """
-    Parses a block-level index file (same 8-column format as mafutils stats).
-    Only offset_start/offset_end are used here.
+    Streams (offset_start, offset_end) pairs from a block-level index file
+    (same 8-column format as mafutils stats). Only those two columns are
+    used here.
+
+    A generator rather than a list on purpose: whole-genome indexes are far
+    too large to materialize. A real 241-species index had ~233M block
+    records, which as a list of tuples measured ~33GB of RAM (plus another
+    ~2GB once it was re-chunked by slicing) and OOM-killed gc at 62GB before
+    it computed anything. Streaming keeps memory flat regardless of genome
+    size.
     """
-    entries = []
     with open(index_file, "r", encoding="utf-8") as fp:
         for line in fp:
             if not line.strip() or line.startswith("#"):
@@ -125,13 +133,22 @@ def parseIndex(index_file, LOG):
             except ValueError:
                 LOG.warning(f"Skipping malformed index line: {line.strip()}")
                 continue
-            entries.append((offset_start, offset_end))
-    return entries
+            yield (offset_start, offset_end)
 
 
-def chunker(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
+def chunker(iterable, size):
+    """
+    Yields lists of up to `size` items from any iterable. Pulls lazily via
+    islice so it works on a generator without materializing the source --
+    the previous list-slicing version required (and copied) the whole
+    sequence up front.
+    """
+    iterator = iter(iterable)
+    while True:
+        chunk = list(islice(iterator, size))
+        if not chunk:
+            return
+        yield chunk
 
 
 #############################################################################
@@ -165,40 +182,63 @@ def workerTask(task_id, maf_file, maf_compression, entries):
     return counts
 
 
-def mergeCounts(results):
-    merged = defaultdict(newBaseCounts)
-    for counts in results:
-        for key, rec in counts.items():
-            m = merged[key]
-            m["A"] += rec["A"]
-            m["C"] += rec["C"]
-            m["G"] += rec["G"]
-            m["T"] += rec["T"]
-    return merged
+def mergeCountsInto(target, counts):
+    """
+    Folds one worker's (species, chrom) base counts into an accumulator.
+    Used to merge each chunk's result as it arrives, rather than collecting
+    every worker's counts and merging at the end.
+    """
+    for key, rec in counts.items():
+        m = target[key]
+        m["A"] += rec["A"]
+        m["C"] += rec["C"]
+        m["G"] += rec["G"]
+        m["T"] += rec["T"]
 
 
 def runParallelGC(maf_file, maf_compression, index_file, processes, chunk_size, LOG, verify_hash=False):
-    LOG.info(f"Parsing index file: {index_file}")
+    LOG.info(f"Streaming index file: {index_file}")
     COMMON.validateIndexHeader(COMMON.readIndexHeader(index_file), maf_file, maf_compression, LOG, strict=verify_hash)
-    entries = parseIndex(index_file, LOG)
-    if not entries:
+
+    LOG.info(f"Streaming index in chunks of {chunk_size} blocks across {processes} process(es).")
+
+    # Bound how many chunks are in flight at once. Submitting every chunk
+    # upfront would queue the whole index into the executor (and collecting
+    # every worker's result before merging would hold every partial count
+    # dict), which reintroduces the memory scaling this streaming is meant to
+    # avoid -- a whole-genome index is ~233M blocks / ~47k chunks.
+    max_in_flight = max(1, processes) * 2
+
+    merged = defaultdict(newBaseCounts)
+    total_blocks = 0
+    tasks_done = 0
+    chunk_iter = enumerate(chunker(iterIndexEntries(index_file, LOG), chunk_size), start=1)
+
+    with ProcessPoolExecutor(max_workers=processes) as executor:
+        in_flight = {}
+        for task_id, chunk in chunk_iter:
+            in_flight[executor.submit(workerTask, task_id, maf_file, maf_compression, chunk)] = len(chunk)
+            if len(in_flight) < max_in_flight:
+                continue
+            done, _pending = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
+            for future in done:
+                # Merge as results arrive, then drop them, so peak memory is
+                # one accumulator plus the in-flight chunks.
+                total_blocks += in_flight.pop(future)
+                mergeCountsInto(merged, future.result())
+                tasks_done += 1
+
+        for future in in_flight:
+            total_blocks += in_flight[future]
+            mergeCountsInto(merged, future.result())
+            tasks_done += 1
+
+    if not total_blocks:
         LOG.error("No valid index entries found.")
         sys.exit(1)
-    LOG.info(f"Loaded {len(entries)} indexed blocks.")
 
-    chunks = list(chunker(entries, chunk_size))
-    LOG.info(f"Running {len(chunks)} tasks with chunk size {chunk_size} across {processes} process(es).")
-
-    results = []
-    with ProcessPoolExecutor(max_workers=processes) as executor:
-        futures = [
-            executor.submit(workerTask, task_id, maf_file, maf_compression, chunk)
-            for task_id, chunk in enumerate(chunks, start=1)
-        ]
-        for future in futures:
-            results.append(future.result())
-
-    return mergeCounts(results)
+    LOG.info(f"Processed {total_blocks} indexed blocks in {tasks_done} task(s).")
+    return merged
 
 
 #############################################################################

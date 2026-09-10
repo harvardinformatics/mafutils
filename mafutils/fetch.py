@@ -67,6 +67,7 @@ import atexit
 import logging
 import bisect
 import time
+import traceback
 from enum import Enum
 from types import SimpleNamespace
 from typing import Annotated, Optional
@@ -80,14 +81,16 @@ from mafutils.lib import loginit as LOGINIT
 
 #############################################################################
 
-MAX_NO_OVERLAP_REGIONS_DEFAULT = 10000
-MAX_NO_OVERLAP_FRACTION_DEFAULT = 0.10
+ADVISORY_NO_OVERLAP_REGIONS = 10000
+ADVISORY_NO_OVERLAP_FRACTION = 0.10
 WORKER_BLOCK_CACHE_MAX = 2048
 
 WORKER_HEADER = None
 WORKER_MAF_FILE = None
 WORKER_MAF_COMPRESSION = None
 WORKER_INDEX = None
+WORKER_INDEX_FILE = None
+WORKER_SCAFFOLD_RUNS = None
 WORKER_OUTPUT = None
 WORKER_SINGLE_OUTPUT = None
 WORKER_SCAFFOLD_SUBDIRS = None
@@ -176,11 +179,15 @@ def initBatchWorker(
     profile,
     prefetched_cache=None,
     scaffold_subdirs=False,
+    index_file=None,
+    scaffold_runs=None,
 ):
     global WORKER_HEADER
     global WORKER_MAF_FILE
     global WORKER_MAF_COMPRESSION
     global WORKER_INDEX
+    global WORKER_INDEX_FILE
+    global WORKER_SCAFFOLD_RUNS
     global WORKER_OUTPUT
     global WORKER_SINGLE_OUTPUT
     global WORKER_SCAFFOLD_SUBDIRS
@@ -197,6 +204,11 @@ def initBatchWorker(
     WORKER_MAF_FILE = maf_file
     WORKER_MAF_COMPRESSION = maf_compression
     WORKER_INDEX = index
+    # Block mode streams the index from disk rather than receiving it: the
+    # in-memory form is ~288 bytes/block (~67GB for a whole-genome index), and
+    # passing it through initargs pickled that whole structure to EVERY worker.
+    WORKER_INDEX_FILE = index_file
+    WORKER_SCAFFOLD_RUNS = scaffold_runs
     WORKER_OUTPUT = output
     WORKER_SINGLE_OUTPUT = single_output
     WORKER_SCAFFOLD_SUBDIRS = scaffold_subdirs
@@ -289,6 +301,138 @@ def parseIndex(index_file, LOG, mode="block"):
             }
 
     return index
+
+#############################################################################
+
+def readScaffoldRuns(scaffold_index_file):
+    """
+    Returns the scaffold index's rows in file order as
+    [(scaffold, maf_start_byte, maf_end_byte), ...].
+
+    Each row is a *run* of consecutive blocks for one scaffold, not a unique
+    scaffold: a MAF may interleave scaffolds, so the same name can appear more
+    than once. tests/example.maf does exactly this (chr4 ... chrX ... chr4),
+    and assuming one run per scaffold silently loses the later blocks. The
+    block index is in MAF order too, so these runs are also contiguous there.
+    """
+    runs = []
+    with open(scaffold_index_file, "r", encoding="utf-8") as fp:
+        for line in fp:
+            if line.startswith("#") or not line.strip():
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 3:
+                continue
+            try:
+                runs.append((fields[0], int(fields[1]), int(fields[2])))
+            except ValueError:
+                continue
+    return runs
+
+
+def parseIndexLine(line):
+    """
+    Parses one block-index line into
+    (scaffold, ref_start, ref_length, offset_start, offset_end), or None if the
+    line is a comment/blank/malformed. Only the columns fetch actually needs.
+    """
+    if not line or line.startswith("#") or not line.strip():
+        return None
+    fields = line.rstrip("\n").split("\t")
+    if len(fields) < 8:
+        return None
+    try:
+        return (fields[0], int(fields[1]), int(fields[2]), int(fields[6]), int(fields[7]))
+    except ValueError:
+        return None
+
+
+def _firstRecordAtOrAfter(fp, offset):
+    """
+    Seeks to `offset` and returns (record, record_offset) for the first
+    COMPLETE record at or after it, or (None, None) at EOF.
+
+    Index lines are variable-length, so there is no arithmetic from "record N"
+    to a byte position -- but seeking to an arbitrary byte and discarding the
+    partial line lands on a record boundary, which is what makes a binary
+    search over the text file possible.
+    """
+    fp.seek(offset)
+    if offset > 0:
+        fp.readline()  # discard the (probably partial) line we landed inside
+    while True:
+        record_offset = fp.tell()
+        line = fp.readline()
+        if not line:
+            return None, None
+        record = parseIndexLine(line)
+        if record is not None:
+            return record, record_offset
+
+
+def findIndexOffsetForMafByte(index_file, maf_offset, window=8192):
+    """
+    Byte offset into the block index of the first record whose block starts at
+    or after `maf_offset` in the MAF.
+
+    The search key is the block's MAF offset because that is the one column
+    guaranteed to increase monotonically through the whole index -- scaffold
+    name and ref_start are only sorted *within* a run, and a scaffold can have
+    several runs (see readScaffoldRuns).
+
+    Binary search by byte position: seek to a midpoint, skip the partial line,
+    compare the first complete record, narrow. ~log2(filesize) probes, so ~35
+    on a 35GB index regardless of how many records it holds. Returns an exact
+    record boundary, since callers treat offsets as record starts.
+    """
+    size = os.path.getsize(index_file)
+    with open(index_file, "r", encoding="utf-8") as fp:
+        lo, hi = 0, size
+        while hi - lo > window:
+            mid = (lo + hi) // 2
+            record, _ = _firstRecordAtOrAfter(fp, mid)
+            if record is None:
+                hi = mid
+                continue
+            if record[3] < maf_offset:
+                lo = mid
+            else:
+                hi = mid
+        _record, record_offset = _firstRecordAtOrAfter(fp, lo)
+        return size if record_offset is None else record_offset
+
+
+def computeRunIndexOffsets(index_file, runs):
+    """
+    Maps each scaffold-index run to where its records begin in the block index.
+
+    One binary search per run (61 runs on the hamster data, 455 on the
+    241-mammal file) done once at startup -- not per region. Run i's records
+    occupy [offsets[i], offsets[i+1]).
+    """
+    return [findIndexOffsetForMafByte(index_file, maf_start) for _scaffold, maf_start, _maf_end in runs]
+
+
+def iterIndexRecordsFrom(fp, offset):
+    """
+    Yields (record, record_offset) from `offset` forward on an already-open
+    index handle. Streaming, so memory never scales with index size.
+
+    `offset` MUST be an exact record boundary (both findIndexOffsetForMafByte
+    and the record_offset values yielded here are). It deliberately does not
+    skip a leading partial line -- doing so would drop the first record when
+    resuming from a known boundary.
+    """
+    fp.seek(offset)
+    while True:
+        record_offset = fp.tell()
+        line = fp.readline()
+        if not line:
+            return
+        record = parseIndexLine(line)
+        if record is not None:
+            yield record, record_offset
+
 
 #############################################################################
 
@@ -461,6 +605,59 @@ def findOverlappingEntries(scaffold, bed_start, bed_end, index, profile_state=No
 
     return overlapping
 
+
+def iterRegionEntries(index_fp, scaffold, bed_start, bed_end, run_indices, runs, run_offsets, resume, state):
+    """
+    Streams the blocks overlapping `scaffold`:[bed_start, bed_end), walking each
+    run of that scaffold in file order.
+
+    Runs are bounded by their MAF byte range (from the scaffold index), NOT by
+    index byte positions: findIndexOffsetForMafByte returns a valid place to
+    *start* scanning, deliberately allowed to sit early, so it must never be
+    treated as an exact boundary. Each record's own offset_start is compared
+    against the run's MAF range instead, which is exact.
+
+    `resume` maps run -> byte offset to restart from, so consecutive regions on
+    a scaffold do not rescan a run from its beginning. Because a worker walks
+    its regions in ascending coordinate order, every later region has
+    start >= bed_start, so any record ending at or before bed_start is
+    irrelevant to all of them -- making the first record ending after bed_start
+    a safe resume point, recorded in state.
+
+    Nothing is buffered: entries are yielded as they stream, so a region
+    spanning an entire scaffold costs O(1) memory here rather than O(blocks).
+    """
+    new_resume = dict(resume)
+    for run in run_indices:
+        _run_scaffold, maf_start, maf_end = runs[run]
+        scan_from = max(run_offsets[run], resume.get(run, 0))
+        resume_set = False
+
+        for record, record_offset in iterIndexRecordsFrom(index_fp, scan_from):
+            rec_scaffold, ref_start, ref_length, offset_start, offset_end = record
+            if offset_start >= maf_end:
+                break                      # past this run in the MAF
+            if offset_start < maf_start:
+                continue                   # not yet into this run
+            if rec_scaffold != scaffold:
+                continue                   # defensive; a run is single-scaffold
+            if ref_start + ref_length <= bed_start:
+                continue                   # block ends before the region starts
+            if not resume_set:
+                new_resume[run] = record_offset
+                resume_set = True
+            if ref_start >= bed_end:
+                break                      # ascending, so nothing further overlaps
+            yield {
+                "ref_start": ref_start,
+                "ref_length": ref_length,
+                "offset_start": offset_start,
+                "offset_end": offset_end,
+            }
+    state["resume"] = new_resume
+
+
+#############################################################################
 
 def prefetchBlockCache(regions, index, maf_file, maf_compression, LOG):
     """
@@ -736,7 +933,7 @@ def fetchByRegion(
     region,
     header,
     maf_fp,
-    index,
+    overlapping_entries,
     output,
     BATCHLOG,
     single_output=False,
@@ -788,7 +985,9 @@ def fetchByRegion(
 
     blocks_written = 0;
 
-    if scaffold not in index:
+    if overlapping_entries is None:
+        # Caller signals "this scaffold isn't in the index at all" by passing
+        # None, rather than fetchByRegion holding an index to check against.
         appendWarning(
             warning_state,
             "missing-scaffold",
@@ -800,8 +999,13 @@ def fetchByRegion(
     blocks_written = 0
 
     scan_timer_start = time.perf_counter() if profile_state is not None else None
-    overlapping_entries = findOverlappingEntries(scaffold, bed_start, bed_end, index, profile_state=profile_state)
-
+    # overlapping_entries is an ITERATOR, deliberately not a list: a single BED
+    # region can span an entire scaffold (hundreds of millions of blocks on a
+    # whole-genome MAF), so materializing its blocks would reintroduce an
+    # O(blocks) blowup for one region. Trimmed output is written to out_stream
+    # inside this loop, so MAF output stays O(1) in block count. (FASTA output
+    # is inherently O(region length x species) -- fasta_seqs below accumulates
+    # each species' sequence before writing.)
     for entry in overlapping_entries:
         try:
             read_timer_start = time.perf_counter() if profile_state is not None else None
@@ -986,49 +1190,86 @@ def fetchByBatch(
     profile_state = initProfileState() if WORKER_PROFILE else None
     batch_timer_start = time.perf_counter() if WORKER_PROFILE else None
 
-    ordered_regions = sorted(
-        enumerate(batch),
-        key=lambda item: (
-            item[1]["scaffold"],
-            item[1]["start"],
-            item[1]["end"],
-            item[0],
-        ),
-    )
+    # Regions arrive already sorted into INDEX order by the parent, which is
+    # what lets this walk the index forward once. Re-sorting here (as this used
+    # to, by scaffold *name*) would break that: index scaffold order is MAF file
+    # order, not alphabetical.
+    index_fp = open(WORKER_INDEX_FILE, "r", encoding="utf-8")
+    scaffold_to_runs, runs, run_offsets = WORKER_SCAFFOLD_RUNS
+    # Per-run resume points, so consecutive regions on a scaffold continue
+    # forward through the index instead of rescanning from the run's start.
+    resume_by_scaffold = {}
 
-    for batch_order, (result_idx, region) in enumerate(ordered_regions, start=1):
-        region_num += 1
+    try:
+        for batch_order, (result_idx, region) in enumerate(enumerate(batch), start=1):
+            region_num += 1
 
-        batch_str = f" [batch {batch_num}.{batch_order}]"
-        BATCHLOG.debug(f">>>{batch_str} Region {region['scaffold']}:{region['start']}-{region['end']}")
+            batch_str = f" [batch {batch_num}.{batch_order}]"
+            BATCHLOG.debug(f">>>{batch_str} Region {region['scaffold']}:{region['start']}-{region['end']}")
 
-        region_result = fetchByRegion(
-            region,
-            WORKER_HEADER,
-            maf_fp,
-            WORKER_INDEX,
-            WORKER_OUTPUT,
-            BATCHLOG,
-            as_fasta=WORKER_AS_FASTA,
-            fasta_header=WORKER_FASTA_HEADER,
-            expected_species=WORKER_EXPECTED_SPECIES,
-            fasta_dedupe=WORKER_FASTA_DEDUPE,
-            verbose=WORKER_VERBOSE,
-            warning_state=warning_state,
-            profile_state=profile_state,
-            scaffold_subdirs=WORKER_SCAFFOLD_SUBDIRS,
-        )
-        batch_results[result_idx] = region_result
-        if not WORKER_SINGLE_OUTPUT:
-            fields = region_result.split("\t")
-            if len(fields) >= 2:
-                try:
-                    if int(fields[1]) == 0:
-                        no_output_regions += 1
-                    else:
-                        written_regions += 1
-                except ValueError:
-                    pass
+            scaffold = region["scaffold"]
+            run_indices = scaffold_to_runs.get(scaffold)
+            if not run_indices:
+                entries = None       # signals "scaffold absent from the index"
+                scan_state = None
+            else:
+                scan_state = {}
+                entries = iterRegionEntries(
+                    index_fp,
+                    scaffold,
+                    region["start"],
+                    region["end"],
+                    run_indices,
+                    runs,
+                    run_offsets,
+                    resume_by_scaffold.get(scaffold, {}),
+                    scan_state,
+                )
+
+            region_result = fetchByRegion(
+                region,
+                WORKER_HEADER,
+                maf_fp,
+                entries,
+                WORKER_OUTPUT,
+                BATCHLOG,
+                as_fasta=WORKER_AS_FASTA,
+                fasta_header=WORKER_FASTA_HEADER,
+                expected_species=WORKER_EXPECTED_SPECIES,
+                fasta_dedupe=WORKER_FASTA_DEDUPE,
+                verbose=WORKER_VERBOSE,
+                warning_state=warning_state,
+                profile_state=profile_state,
+                scaffold_subdirs=WORKER_SCAFFOLD_SUBDIRS,
+            )
+
+            if scan_state and "resume" in scan_state:
+                # Resume the next region's scan from the first block that could
+                # still matter. If fetchByRegion returned before exhausting the
+                # iterator, "resume" is simply absent and the previous (earlier,
+                # conservative) offsets are kept -- correct, just more rescanning.
+                resume_by_scaffold[scaffold] = scan_state["resume"]
+
+            batch_results[result_idx] = region_result
+            if not WORKER_SINGLE_OUTPUT:
+                # Field 4 is n.overlapping.blocks (see summary_headers). This
+                # used to read field 1, which is the region's START coordinate
+                # -- so every region beginning at coordinate 0 was counted as
+                # "no output" despite having been extracted fine, inflating
+                # zero_overlap_regions and tripping the zero-overlap failure
+                # threshold. A single-region BED starting at 0 always failed.
+                fields = region_result.split("\t")
+                if len(fields) >= 5:
+                    try:
+                        if int(fields[4]) == 0:
+                            no_output_regions += 1
+                        else:
+                            written_regions += 1
+                    except ValueError:
+                        pass
+    finally:
+        index_fp.close()
+
     if profile_state is not None:
         profile_state["time_batch_total"] = time.perf_counter() - batch_timer_start
 
@@ -1058,13 +1299,19 @@ def fetchByScaffold(scaffold, start_end, maf_file, maf_header, maf_compression, 
     try:
         with COMMON.openMaf(maf_file, maf_compression, "rb") as mfp, open(output_path, "wb") as outfp:
             LOG.info(f">>> Scaffold {scaffold}");
-            data = COMMON.readMafBlockBytes(mfp, maf_compression, start, end)
             outfp.write(maf_header.encode("utf-8"))
-            outfp.write(data)
+            # Streamed in bounded chunks: a scaffold can be hundreds of GB,
+            # far too large to materialize as one bytes object.
+            written = COMMON.copyMafRangeToStream(mfp, maf_compression, start, end, outfp)
     except Exception as e:
-        LOG.error(f"{scaffold}: {e}")
+        # repr(), plus the traceback, because some of the exceptions that
+        # actually occur here have an empty str() -- MemoryError being the
+        # one that made a real failure log as a blank message.
+        LOG.error(f"{scaffold}: FAILED to extract: {e!r}")
+        LOG.debug("Traceback for %s:\n%s", scaffold, traceback.format_exc())
+        return {"scaffold": scaffold, "output_path": output_path, "ok": False, "error": repr(e)}
 
-    return f"{output_path}: Wrote {scaffold}";
+    return {"scaffold": scaffold, "output_path": output_path, "ok": True, "bytes_written": written}
 
 
 def fetchScaffoldsSequential(ordered_scaffolds, index, maf_file, maf_header, maf_compression, out_dir, LOG, scaffold_subdirs=False):
@@ -1081,13 +1328,16 @@ def fetchScaffoldsSequential(ordered_scaffolds, index, maf_file, maf_header, maf
             output_path = buildOutputPath(out_dir, scaffold, scaffold, ".maf", scaffold_subdirs)
             try:
                 LOG.info(f">>> Scaffold {scaffold}");
-                data = COMMON.readMafBlockBytes(mfp, maf_compression, start, end)
                 with open(output_path, "wb") as outfp:
                     outfp.write(maf_header.encode("utf-8"))
-                    outfp.write(data)
+                    # Streamed in bounded chunks -- see fetchByScaffold.
+                    written = COMMON.copyMafRangeToStream(mfp, maf_compression, start, end, outfp)
             except Exception as e:
-                LOG.error(f"{scaffold}: {e}")
-            results.append(f"{output_path}: Wrote {scaffold}")
+                LOG.error(f"{scaffold}: FAILED to extract: {e!r}")
+                LOG.debug("Traceback for %s:\n%s", scaffold, traceback.format_exc())
+                results.append({"scaffold": scaffold, "output_path": output_path, "ok": False, "error": repr(e)})
+                continue
+            results.append({"scaffold": scaffold, "output_path": output_path, "ok": True, "bytes_written": written})
     return results
 
 
@@ -1157,7 +1407,55 @@ def run_fetch(args, cmdline="mafutils fetch"):
 
     LOG.info(f"Parsing index file.... {index_file}");
     COMMON.validateIndexHeader(COMMON.readIndexHeader(index_file), args.maf_file, maf_compression, LOG, strict=args.verify_hash)
-    index = parseIndex(index_file, LOG, args.mode);
+
+    # Scaffold mode's index is one line per scaffold (trivially small), so it is
+    # still loaded. Block mode streams its index instead -- see below.
+    index = parseIndex(index_file, LOG, args.mode) if args.mode == "scaffold" else None
+
+    scaffold_runs = None
+    scaffold_first_run = {}
+    if args.mode == "block":
+        scaffold_index_file = COMMON.deriveScaffoldIndexPath(args.maf_file)
+        if not os.path.isfile(scaffold_index_file):
+            LOG.error(
+                f"Block mode needs the scaffold index ({scaffold_index_file}) to order regions "
+                f"the same way the block index is ordered, but it was not found. "
+                f"Run `mafutils index` to create it."
+            )
+            sys.exit(1)
+
+        # The two indexes must come from the same `mafutils index` run: block
+        # mode locates blocks using byte ranges recorded in the scaffold index,
+        # so a mismatched pair silently drops regions (an off-by-one boundary
+        # is enough to skip every run's first block). Both files stamp the
+        # MAF's size/mtime/hash in their header, so compare those -- the same
+        # cross-check `mafutils validate` performs.
+        block_header = COMMON.readIndexHeader(index_file)
+        scaffold_header = COMMON.readIndexHeader(scaffold_index_file)
+        if block_header is None or scaffold_header is None or block_header != scaffold_header:
+            LOG.error(
+                f"The block index ({index_file}) and scaffold index ({scaffold_index_file}) "
+                f"do not come from the same `mafutils index` run, so their byte offsets cannot "
+                f"be trusted together. Rebuild both with `mafutils index`."
+            )
+            LOG.error(f"  block index header:    {block_header}")
+            LOG.error(f"  scaffold index header: {scaffold_header}")
+            sys.exit(1)
+
+        runs = readScaffoldRuns(scaffold_index_file)
+        # One binary search per run, once, to get a starting point for each
+        # run's records. These are scan hints, not exact bounds -- the run's
+        # MAF byte range is what actually delimits it.
+        run_offsets = computeRunIndexOffsets(index_file, runs)
+        scaffold_to_runs = {}
+        for i, (scaffold, _s, _e) in enumerate(runs):
+            scaffold_to_runs.setdefault(scaffold, []).append(i)
+            scaffold_first_run.setdefault(scaffold, i)
+        scaffold_runs = (scaffold_to_runs, runs, run_offsets)
+        LOG.info(
+            f"Loaded {len(runs)} scaffold run(s) covering {len(scaffold_to_runs)} scaffold(s) "
+            f"from {scaffold_index_file}"
+        )
 
     LOG.info(f"Parsing BED file...... {args.bed_file}");
     regions = parseBed(args.bed_file, LOG, args.mode);
@@ -1208,6 +1506,7 @@ def run_fetch(args, cmdline="mafutils fetch"):
         # what lets a single reused handle avoid ever seeking backward.
         ordered_scaffolds = sorted(scaffold_set, key=lambda s: index[s][0])
 
+        scaffold_results = []
         if maf_compression == "gz":
             if args.processes > 1:
                 LOG.warning(
@@ -1215,8 +1514,7 @@ def run_fetch(args, cmdline="mafutils fetch"):
                     "gzip-compressed files; --processes will be ignored. (Use a bgzip-compressed MAF "
                     "for real parallel speedup on compressed input.)"
                 )
-            for result in fetchScaffoldsSequential(ordered_scaffolds, index, args.maf_file, maf_header, maf_compression, args.output, LOG, scaffold_subdirs=args.scaffold_subdirs):
-                LOG.info(result)
+            scaffold_results = fetchScaffoldsSequential(ordered_scaffolds, index, args.maf_file, maf_header, maf_compression, args.output, LOG, scaffold_subdirs=args.scaffold_subdirs)
         else:
             # Extract from MAF using the region index for matching scaffolds
             with ProcessPoolExecutor(max_workers=args.processes) as executor:
@@ -1235,8 +1533,39 @@ def run_fetch(args, cmdline="mafutils fetch"):
                         args.scaffold_subdirs,
                     ))
                 for future in futures:
-                    result = future.result()
-                    LOG.info(result)
+                    scaffold_results.append(future.result())
+
+        # Only report "Wrote" for extractions that actually produced data --
+        # never for one that raised or came back empty.
+        for result in scaffold_results:
+            if result["ok"] and result["bytes_written"] > 0:
+                LOG.info(f"{result['output_path']}: Wrote {result['scaffold']} ({result['bytes_written']} bytes)")
+
+        # Any scaffold that failed to extract must fail the run. Previously
+        # these errors were logged and then reported as "Wrote <scaffold>"
+        # anyway, so fetch exited 0 with a 0-byte output file and downstream
+        # consumers proceeded on silently-corrupt state.
+        failed = [r for r in scaffold_results if not r["ok"]]
+        if failed:
+            LOG.error(
+                "Failed to extract %d of %d scaffold(s): %s",
+                len(failed),
+                len(scaffold_results),
+                ", ".join(r["scaffold"] for r in failed),
+            )
+            sys.exit(1)
+
+        empty = [r for r in scaffold_results if r["ok"] and r["bytes_written"] == 0]
+        if empty:
+            # No exception, but nothing came back for the requested range --
+            # e.g. a bad/stale index offset. Still not a success.
+            LOG.error(
+                "Extracted 0 alignment bytes for %d scaffold(s): %s. Check that the index matches this MAF.",
+                len(empty),
+                ", ".join(r["scaffold"] for r in empty),
+            )
+            sys.exit(1)
+
         return;  # Done with scaffold mode
 
     ##############################
@@ -1261,18 +1590,35 @@ def run_fetch(args, cmdline="mafutils fetch"):
                 "for real parallel speedup on compressed input.)"
             )
         effective_processes = 1
-        prefetch_cache = prefetchBlockCache(regions, index, args.maf_file, maf_compression, LOG)
-        # Every block any region needs is now decoded, in strictly-ascending
-        # file order, exactly once. initBatchWorker pre-seeds the worker's
-        # cache from this so fetchByRegion's lookups never seek at all.
+        # No prefetch pass any more. Regions are sorted into index order below
+        # and each worker walks the index forward, so blocks are read in
+        # ascending file order for EVERY compression type -- which is the
+        # property prefetchBlockCache existed to give gzip, now obtained
+        # structurally instead of by decoding every needed block into RAM
+        # first (a real run reported "Prefetching 1031475 distinct block(s)",
+        # i.e. its own O(needed blocks) memory blowup). Reuse of a block shared
+        # by neighbouring regions is still handled, by the bounded
+        # WORKER_BLOCK_CACHE LRU -- and sorting makes those regions adjacent,
+        # so a small cache captures it.
+
+    # Sort regions into INDEX order (scaffold order as it appears in the MAF,
+    # then coordinate), so the block index can be streamed forward instead of
+    # loaded into memory. Regions are the cheap side of this: ~979k regions vs
+    # ~233M blocks on a whole-genome MAF.
+    unknown_rank = len(scaffold_first_run)
+    regions.sort(key=lambda r: (scaffold_first_run.get(r["scaffold"], unknown_rank), r["start"], r["end"]))
 
     num_regions = len(regions);
-    batch_size = pick_chunk_size(num_regions, effective_processes);
-    if batch_size >= num_regions:
-        batch_size = 1
+    # One batch per worker: each streams its own span of the index. Splitting
+    # by region count (not by scaffold) keeps parallelism independent of how
+    # many scaffolds there are and of how wildly their sizes differ.
+    n_batches = max(1, min(effective_processes, num_regions))
+    batch_size = (num_regions + n_batches - 1) // n_batches
     LOG.info(f"Using batch size of {batch_size} regions for {num_regions} total regions with {effective_processes} processes.");
     batches = list(chunker(regions, size=batch_size))
     LOG.info(f"Divided {len(regions)} regions into {len(batches)} batches of up to {batch_size} regions each.");
+
+
     # Region batching for parallel processing
 
     if args.single_output:
@@ -1327,6 +1673,8 @@ def run_fetch(args, cmdline="mafutils fetch"):
     zero_overlap_regions = 0
     fail_fast_triggered = False
     fail_fast_message = None
+    no_overlap_threshold_warned = False
+    missing_scaffold_regions = 0
     profile_totals = initProfileState() if args.profile else None
     profiled_batches = 0
     with ProcessPoolExecutor(
@@ -1336,7 +1684,7 @@ def run_fetch(args, cmdline="mafutils fetch"):
             maf_header,
             args.maf_file,
             maf_compression,
-            index,
+            None,   # block mode streams the index; nothing to hand to workers
             args.output,
             args.single_output,
             args.fasta,
@@ -1347,6 +1695,8 @@ def run_fetch(args, cmdline="mafutils fetch"):
             args.profile,
             prefetch_cache,
             args.scaffold_subdirs,
+            index_file,
+            scaffold_runs,
         ),
     ) as executor, open(info_outfile, "w") as info_out:
         summary_headers = ["scaffold", "start", "end", "basename", "n.overlapping.blocks", "block.lengths", "interblock.distances", "n.sequences"]
@@ -1376,6 +1726,7 @@ def run_fetch(args, cmdline="mafutils fetch"):
                         info_out.write(r + "\n")
                     total_regions_reported += result["processed_regions"]
                     zero_overlap_regions += result["zero_overlap_regions"]
+                    missing_scaffold_regions += result["warning_counts"].get("missing-scaffold", 0)
 
                     if result["warning_count"] > 0 and args.verbose:
                         for warning_message in result["warning_messages"]:
@@ -1396,19 +1747,27 @@ def run_fetch(args, cmdline="mafutils fetch"):
                         formatWarningCounts(result["warning_counts"]),
                     )
 
-                    if zero_overlap_regions > MAX_NO_OVERLAP_REGIONS_DEFAULT:
-                        fail_fast_triggered = True
-                        fail_fast_message = (
-                            f"Zero-overlap regions ({zero_overlap_regions}) exceeded hardcoded max "
-                            f"({MAX_NO_OVERLAP_REGIONS_DEFAULT}). Failing run."
-                        )
-                    elif zero_overlap_fraction_final_floor > MAX_NO_OVERLAP_FRACTION_DEFAULT:
-                        fail_fast_triggered = True
-                        fail_fast_message = (
-                            f"Zero-overlap fraction cannot recover below hardcoded max "
-                            f"({MAX_NO_OVERLAP_FRACTION_DEFAULT:.6f}); current lower bound is "
-                            f"{zero_overlap_fraction_final_floor:.6f}. Failing run."
-                        )
+                    # Advisory only -- regions that overlap no alignment block
+                    # are a normal outcome when fetching many intervals, so
+                    # they warn rather than abort. (The genuinely diagnostic
+                    # case, *every* region finding nothing, is still fatal --
+                    # see the end-of-run check.) Warn once, not per batch.
+                    if not no_overlap_threshold_warned:
+                        if zero_overlap_regions > ADVISORY_NO_OVERLAP_REGIONS:
+                            no_overlap_threshold_warned = True
+                            LOG.warning(
+                                "Zero-overlap regions (%d) exceeded the advisory max (%d); continuing.",
+                                zero_overlap_regions,
+                                ADVISORY_NO_OVERLAP_REGIONS,
+                            )
+                        elif zero_overlap_fraction_final_floor > ADVISORY_NO_OVERLAP_FRACTION:
+                            no_overlap_threshold_warned = True
+                            LOG.warning(
+                                "Zero-overlap fraction is at least %.6f, above the advisory max "
+                                "(%.6f); continuing.",
+                                zero_overlap_fraction_final_floor,
+                                ADVISORY_NO_OVERLAP_FRACTION,
+                            )
                 else:
                     results.append(result["results"])
 
@@ -1443,6 +1802,19 @@ def run_fetch(args, cmdline="mafutils fetch"):
             profile_totals["time_write_fasta"],
         )
 
+    if not args.single_output and missing_scaffold_regions > 0:
+        # Advisory, like the other non-overlap outcomes: fetch is normally
+        # pointed at many intervals and a BED may legitimately carry scaffolds
+        # this MAF doesn't have. Still worth calling out prominently, since the
+        # usual cause is a naming mismatch (e.g. "chr1" vs "1") or the wrong
+        # index, and every region on that scaffold silently yields nothing.
+        LOG.warning(
+            "%d region(s) reference a scaffold that is not in the index at all. If that is "
+            "unexpected, check that the BED's scaffold names match the MAF's (and that this is "
+            "the right index).",
+            missing_scaffold_regions,
+        )
+
     if not args.single_output and total_regions_reported > 0 and zero_overlap_regions > 0:
         zero_overlap_fraction = zero_overlap_regions / total_regions_reported
         LOG.warning(
@@ -1451,26 +1823,31 @@ def run_fetch(args, cmdline="mafutils fetch"):
             total_regions_reported,
             zero_overlap_fraction,
         )
+        # Advisory too. A region overlapping no alignment block is normal data,
+        # not a malfunction -- fetch is typically pointed at many intervals, and
+        # a one-region BED that happens not to overlap is the same situation as
+        # "all regions" failing. Genuine misuse is caught earlier and loudly:
+        # index/MAF hash+size mismatch (validateIndexHeader), a block/scaffold
+        # index pair from different runs, and per-scaffold extraction failures.
         if zero_overlap_regions == total_regions_reported:
-            LOG.error("No regions overlapped any MAF block. Failing run.")
-            sys.exit(2)
+            LOG.warning("No regions overlapped any MAF block.")
+        # The count/fraction thresholds are advisory: some regions not
+        # overlapping any block is expected when fetching many intervals.
         if (
-            MAX_NO_OVERLAP_REGIONS_DEFAULT >= 0
-            and zero_overlap_regions > MAX_NO_OVERLAP_REGIONS_DEFAULT
+            ADVISORY_NO_OVERLAP_REGIONS >= 0
+            and zero_overlap_regions > ADVISORY_NO_OVERLAP_REGIONS
         ):
-            LOG.error(
-                "Zero-overlap regions (%d) exceeded hardcoded max (%d). Failing run.",
+            LOG.warning(
+                "Zero-overlap regions (%d) exceeded the advisory max (%d).",
                 zero_overlap_regions,
-                MAX_NO_OVERLAP_REGIONS_DEFAULT,
+                ADVISORY_NO_OVERLAP_REGIONS,
             )
-            sys.exit(2)
-        if zero_overlap_fraction > MAX_NO_OVERLAP_FRACTION_DEFAULT:
-            LOG.error(
-                "Zero-overlap fraction (%.6f) exceeded hardcoded max (%.6f). Failing run.",
+        if zero_overlap_fraction > ADVISORY_NO_OVERLAP_FRACTION:
+            LOG.warning(
+                "Zero-overlap fraction (%.6f) exceeded the advisory max (%.6f).",
                 zero_overlap_fraction,
-                MAX_NO_OVERLAP_FRACTION_DEFAULT,
+                ADVISORY_NO_OVERLAP_FRACTION,
             )
-            sys.exit(2)
 
     # if args.single_output:
     #     with open(output_file, "w", encoding="utf-8") as out_stream:

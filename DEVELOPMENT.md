@@ -4,15 +4,15 @@ Internal implementation notes, gotchas, and maintainer workflows (testing,
 releasing) for developing `mafutils` itself — see [`README.md`](README.md)
 for user-facing installation/usage docs.
 
-- `tests/example.maf.scaffold.idx` is preserved as an older, headerless
-  scaffold-index fixture for comparison — it deliberately sits at
-  `example.maf`'s *default* scaffold-index path
-  (`common.deriveScaffoldIndexPath`), so `mafutils validate` against the
-  checked-in `example.maf`/`example.maf.block.idx` pair reports
-  UNVERIFIABLE rather than VERIFIED (it can't cross-check a headerless
-  scaffold index against the block index — see below). Tests exercising
-  the "clean, fully verified match" case build a fresh pair with
-  `mafutils index` in a tmp dir instead of using this fixture pair directly.
+- `tests/example.maf.scaffold.idx` is a **current-format** index, consistent
+  with `example.maf.block.idx`. It used to be a deliberately preserved
+  headerless/off-by-one fixture, but `fetch` block mode now reads it to order
+  regions (see the streaming note below), and a stale pair silently drops
+  regions — an off-by-one run boundary is enough to skip every run's first
+  block. Tests that need a *headerless* index now build one in `tmp_path` by
+  stripping the header (`writeHeaderlessIndex` in `tests/test_validate.py`),
+  so no committed file's staleness is load-bearing any more. Keep these two
+  index files in sync: regenerate both with `mafutils index` together.
 - `tests/example.maf.scaffold.regenerated.idx` is the scaffold index produced
   by the current `mafutils index` implementation.
 - The real production scaffold indexes checked so far match the regenerated
@@ -54,8 +54,8 @@ for user-facing installation/usage docs.
   is backward compatible. Format-1 indexes (pre-dating size/mtime/hash)
   simply lack those keys in the parsed header dict — every consumer treats
   their absence as "can't check this dimension," not an error, same as a
-  fully missing header. `tests/example.maf.scaffold.idx` is deliberately
-  kept in format-1 shape (see above) specifically to exercise this path.
+  fully missing header. Tests build a headerless index on the fly rather than
+  relying on a committed one (see above).
 - **Computing the hash costs nothing extra at `mafutils index` time, for
   all three compression types** — this was the whole point of always
   storing it. `common._HashingRawIO` (an `io.RawIOBase` subclass) sits
@@ -168,6 +168,134 @@ for user-facing installation/usage docs.
   **bgzip deliberately stays on the text+`tell()` path** — its virtual offsets
   are not additive, so a byte counter cannot reproduce them (same root cause as
   the straddling-`a`-line bug above).
+- **Whole-scaffold extraction must stream; `readMafBlockBytes` is only for
+  block-sized ranges.** `fetch -m scaffold` used to do
+  `readMafBlockBytes(...)` for a whole scaffold, which materializes the range
+  as one bytes object. On a real 7.4TB 241-species MAF, chr1 spans bytes
+  16 -> 597,495,640,164, so that became a single **~597GB `read()`** and died
+  with a `MemoryError`. Two traps worth knowing: `str(MemoryError())` is the
+  **empty string**, so the failure logged as a completely blank
+  `[ERROR] chr1:` message; and with memory overcommit the doomed read
+  actually starts, so at `-p 1` it looks like a hang rather than an error.
+  `common.copyMafRangeToStream()` now copies in bounded chunks (O(chunk_size)
+  memory regardless of range size) straight into the output handle. Note its
+  bgzip branch also had to change: the old line-by-line loop accumulated
+  lines into a list to `join()` at the end, so it was O(range) too --
+  fixing only the uncompressed branch would have left bgzip broken at scale.
+- **Scaffold extraction failures now fail the run.** Both `fetchByScaffold`
+  and `fetchScaffoldsSequential` used to catch any exception, log it, and
+  then report `"Wrote <scaffold>"` regardless, so `fetch` exited **0** with a
+  0-byte output file -- a downstream Snakemake pipeline consumed that as
+  success and only broke several steps later. They now return a status dict,
+  the caller `sys.exit(1)`s if any scaffold failed *or* extracted 0 bytes,
+  "Wrote" is logged only for genuinely non-empty output, and errors are
+  logged with `repr(e)` plus a debug traceback (precisely because the
+  exception that actually occurred had an empty `str()`). This was also a
+  direct violation of `AGENTS.md`'s "never insert silent fallbacks or error
+  handling that could hide errors" rule -- worth re-reading the other
+  `except Exception` sites against that standard.
+- **`gc` streams the block index rather than loading it.** `gc.parseIndex`
+  built a list of every block's `(offset_start, offset_end)`, then
+  `list(chunker(...))` **sliced that list**, making a second full copy.
+  Measured peak, scaling perfectly linearly: 34MB @ 250k blocks, 136MB @ 1M,
+  563MB @ 4M -- extrapolating to **~32GB at the 233M blocks** of a real
+  whole-genome index (observed as a 62GB-RSS OOM kill before any GC was
+  computed). Replaced by `iterIndexEntries()` (a generator) plus an
+  `islice`-based `chunker()` that never materializes its source, with a
+  bounded number of in-flight futures and results merged as they arrive via
+  `mergeCountsInto()` -- submitting all ~47k chunks upfront, or collecting
+  every worker's count dict before merging, would each have reintroduced the
+  same scaling. Peak is now **flat at ~1.5MB** regardless of index size.
+- **`stats` streams its index the same way**, with three wrinkles `gc` didn't
+  have. (1) `block_id` is assigned during index parsing, and the original
+  incremented it *before* the `int()` conversions, so a line with enough
+  fields that fails to parse still consumes an id; `iterIndexEntries`
+  reproduces that exactly, since `block_id` is written into the per-block
+  output table. (2) The gz path used to set `chunk_size = len(entries)` to
+  force one single task, keeping that one worker's seeks forward-only --
+  which requires knowing the entry count upfront, the one thing streaming
+  can't do. `workerTask` now takes an optional `maf_fp`, and the
+  single-process path opens one handle and reuses it across chunks, which
+  preserves forward-only seeking without materializing anything (measured:
+  no gz slowdown, 41.3s -> 40.4s). (3) Results are merged on arrival via
+  `mergeStatsInto`/`newStatsAccumulator` rather than collected -- ~47k chunk
+  results, each carrying a per-species dict, would otherwise scale with
+  index size just like the entries list did.
+- **`stats`' per-block output rows were being concatenated in lexicographic
+  filename order** -- a pre-existing bug, unrelated to streaming, found while
+  testing the above. Each chunk writes `maf_stats.blocks.task<N>.tsv` and
+  `writeBlockTable` did `sorted(block_tmp_paths)`, so `task10` sorted before
+  `task2` and `block.tsv` came out badly out of genomic order for any run
+  with >=10 chunks (a real 269k-block run has 54). Results are now tracked
+  as `(task_id, path)` and sorted numerically; verified 0 out-of-order
+  transitions across 269,308 rows. Note this *changes* `block.tsv` row order
+  versus older mafutils for multi-chunk runs -- it was wrong before.
+- **`fetch` block mode streams the index too, by sorting regions into index
+  order instead of doing random access.** It used to build a 5-key **dict per
+  block** (~288 bytes/block, ~67GB at 233M blocks) so it could `bisect` by
+  coordinate. Now regions are sorted into index order and each worker walks its
+  own span of the index forward, matching regions as it passes them -- regions
+  are the cheap side (979k regions vs 233M blocks, ~240x fewer). Measured on
+  20k real regions against the 8.09M-block hamster index: **3.30GB -> 47MB peak
+  RSS and 8.8x faster** (68.7s -> 7.7s; the old path spent most of its time
+  building that structure and pickling it to every worker), with all 20,000
+  per-region outputs byte-identical for `none`/`gz`/`bgzip`.
+  Four things that make this correct, each of which broke a first attempt:
+  1. **Scaffold order is MAF file order, not alphabetical.** Real data runs
+     `CM000994.3, GL456210.1, ..., CM000995.3`. The ordering comes from
+     `<maf>.scaffold.idx`, whose line order is exactly the block index's.
+     Sorting by scaffold *name* would seek backwards through the index.
+  2. **A scaffold can occupy several disjoint runs.** MAFs may interleave
+     scaffolds -- `tests/example.maf` does (`chr4 ... chrX ... chr4`), so
+     `chr4` has two runs. `readScaffoldRuns` returns one entry per *run*, not
+     per scaffold; assuming one contiguous run per scaffold silently loses the
+     later blocks.
+  3. **Runs are bounded by their MAF byte range, not by index byte offsets.**
+     `findIndexOffsetForMafByte` binary-searches the index *by byte position*
+     (seek to a midpoint, discard the partial line, compare the next complete
+     record -- ~35 probes for 35GB, the `look(1)` technique) using
+     `offset_start`, the only column that increases monotonically through the
+     whole file. Its result is a valid place to *start* scanning, deliberately
+     allowed to sit early, so it must never be treated as an exact boundary.
+  4. **Offsets passed between helpers are exact record boundaries.**
+     `iterIndexRecordsFrom` does NOT skip a leading partial line, because
+     resume offsets point at real record starts; skipping one dropped the first
+     record of every region after the first.
+  Entries reach `fetchByRegion` as an **iterator**, never a list: one BED region
+  can span a whole scaffold, so materializing its blocks would reintroduce an
+  O(blocks) blowup for a single region. (FASTA output is still inherently
+  O(region length x species), since `fasta_seqs` accumulates before writing.)
+  Block mode now also requires the block and scaffold indexes to come from the
+  same `mafutils index` run, and errors if their headers disagree -- it locates
+  blocks via byte ranges recorded in the scaffold index, so a mismatched pair
+  silently drops regions.
+- **`prefetchBlockCache` is gone.** It existed to give gzip "read every needed
+  block once, in ascending file order", but it materialized the decoded text of
+  every needed block (a real run logged "Prefetching 1031475 distinct
+  block(s)") -- its own O(needed blocks) memory blowup. Streaming the index in
+  order gives that property to *all three* compression types structurally, and
+  reuse between neighbouring regions is covered by the bounded
+  `WORKER_BLOCK_CACHE` LRU, since sorting makes such regions adjacent.
+- **`fetch`'s no-output accounting read the wrong column, and it mattered a
+  lot.** The per-region summary line is `scaffold, start, end, basename,
+  n.overlapping.blocks, ...`; the code checked field **1** (`start`) instead of
+  field **4** (`n.overlapping.blocks`), so it was really asking "does this
+  region start at coordinate 0?". Two opposite symptoms: a region starting at 0
+  that worked fine was counted as "no output" (a one-region BED at coordinate 0
+  wrote correct output and then **failed the run**), while a region elsewhere
+  that found zero blocks was counted as written. On `tests/example.bed` the two
+  errors cancelled to exactly 1/10 = 0.10 -- precisely the threshold, which
+  fires on `>` -- so every test passed and the thresholds were never really
+  exercised.
+- **Non-overlap outcomes are advisory, not fatal.** With the count fixed, the
+  leftover hardcoded thresholds from the abandoned `--max-no-overlap-*` feature
+  started failing legitimate runs (`example.bed` genuinely has 2/10 = 20%
+  non-overlapping). `fetch` is normally pointed at many intervals, so
+  `ADVISORY_NO_OVERLAP_REGIONS`/`ADVISORY_NO_OVERLAP_FRACTION`, "all regions
+  produced nothing", and "BED names a scaffold absent from the index" all now
+  **warn and continue**. Real misuse is still caught loudly and earlier:
+  index/MAF size+hash mismatch, a mismatched block/scaffold index pair, and
+  per-scaffold extraction failures.
 - The vendored `bgzf.BgzfReader` has no `.name` attribute (unlike `gzip.GzipFile`),
   so `fetch.py` gets the MAF's display filename from the known `maf_file`
   path (`WORKER_MAF_FILE`), not from the open file handle.

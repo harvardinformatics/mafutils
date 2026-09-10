@@ -126,6 +126,29 @@ def test_sequential_and_parallel_paths_produce_identical_output(tmp_path):
     assert read_species(seq_prefix + ".species.tsv") == read_species(par_prefix + ".species.tsv")
 
 
+@pytest.mark.parametrize("processes,chunk_size", [(1, 1), (1, 3), (2, 1), (2, 2), (4, 3), (1, 10000)])
+def test_output_is_invariant_to_chunk_size_and_process_count(processes, chunk_size, tmp_path):
+    """
+    The index is streamed in chunks and each chunk's result is merged as it
+    arrives, so results must not depend on how the stream happens to be
+    divided. Tiny chunk sizes force many chunks (and, in the parallel path,
+    exercise the bounded in-flight/merge-on-arrival loop) where the default
+    would produce a single chunk and test none of it.
+    """
+    baseline_prefix = os.path.join(str(tmp_path), "baseline")
+    run_stats([MAF_FILE, INDEX_FILE, "-o", baseline_prefix, "-p", "1", "--chunk-size", "10000"])
+
+    out_prefix = os.path.join(str(tmp_path), f"p{processes}c{chunk_size}")
+    run_stats([MAF_FILE, INDEX_FILE, "-o", out_prefix, "-p", str(processes), "--chunk-size", str(chunk_size)])
+
+    assert read_overall(out_prefix + ".overall.tsv") == read_overall(baseline_prefix + ".overall.tsv")
+    assert read_species(out_prefix + ".species.tsv") == read_species(baseline_prefix + ".species.tsv")
+    with open(out_prefix + ".block.tsv") as a, open(baseline_prefix + ".block.tsv") as b:
+        # Block rows are written per chunk into temp files and concatenated,
+        # so this also guards their ordering/block_id numbering.
+        assert a.read() == b.read()
+
+
 def test_expected_species_file_reports_missing_species(tmp_path):
     species_file = os.path.join(str(tmp_path), "species.txt")
     with open(species_file, "w", encoding="utf-8") as fp:

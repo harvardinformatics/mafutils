@@ -195,10 +195,61 @@ def computeFileHash(maf_file, algo="md5"):
 
 #############################################################################
 
+COPY_CHUNK_SIZE = 8 * 1024 * 1024
+
+
+def copyMafRangeToStream(handle, compression, offset_start, offset_end, out_stream, chunk_size=COPY_CHUNK_SIZE):
+    """
+    Copies the byte range [offset_start, offset_end) from an open binary-mode
+    MAF handle straight into out_stream, in bounded chunks. Returns the number
+    of bytes written.
+
+    Use this instead of readMafBlockBytes() whenever the range can be large --
+    notably whole-scaffold extraction. readMafBlockBytes() materializes the
+    entire range as one bytes object, which is fine for a single alignment
+    block (KBs) but fatal for a scaffold: on a real 7.4TB 241-species MAF,
+    chr1 spans bytes 16 -> 597,495,640,164, so that became a single ~597GB
+    read() and died with a MemoryError whose str() is the empty string
+    (hence a completely blank error message in the log).
+
+    Memory here is O(chunk_size) regardless of range size, for every
+    compression type -- including bgzip, whose line-by-line path must also
+    write as it goes rather than accumulating lines to join at the end.
+    """
+    handle.seek(offset_start)
+    written = 0
+
+    if compression == "bgzip":
+        # Virtual offsets are comparable but not subtractable, so read
+        # forward until the handle's position reaches offset_end. Write each
+        # line straight out instead of accumulating them.
+        while handle.tell() < offset_end:
+            line = handle.readline()
+            if not line:
+                break
+            out_stream.write(line)
+            written += len(line)
+        return written
+
+    remaining = offset_end - offset_start
+    while remaining > 0:
+        chunk = handle.read(min(chunk_size, remaining))
+        if not chunk:
+            break
+        out_stream.write(chunk)
+        written += len(chunk)
+        remaining -= len(chunk)
+    return written
+
+
 def readMafBlockBytes(handle, compression, offset_start, offset_end):
     """
     Seeks an open binary-mode MAF handle to offset_start and reads exactly
     the bytes of one block, returning them.
+
+    Only appropriate for genuinely block-sized ranges, since it holds the
+    whole range in memory -- see copyMafRangeToStream() for large ranges
+    such as whole scaffolds.
 
     For "none"/"gz", offset_start/offset_end are raw byte positions /
     decompressed-stream positions respectively, so a simple subtraction
