@@ -296,6 +296,157 @@ for user-facing installation/usage docs.
   **warn and continue**. Real misuse is still caught loudly and earlier:
   index/MAF size+hash mismatch, a mismatched block/scaffold index pair, and
   per-scaffold extraction failures.
+- **A stitched non-reference FASTA row is homology-by-alignment, not a called
+  locus — and its header coordinates are a bounding box.** This is the single
+  most confusing property of `fetch --fasta`, so: MAF blocks are contiguous in
+  the **reference** only. Each block is individually a proper alignment (verified
+  on 20,000 real blocks: every `s`-line's non-gap count equals its declared
+  size, every block rectangular), and a block boundary exists *precisely
+  because* contiguity broke somewhere — large indel, inversion, rearrangement,
+  assembly break, or a change in the aligned species set. Stitching a
+  multi-block region concatenates those independent alignments; **no padding is
+  inserted for the query's genomic distance**, so a 5 kb jump or a scaffold
+  change costs zero characters. Column correspondence is fully preserved (so it
+  is still an alignment, and phastCons/phyloP on it are sound), but each row is
+  not necessarily one genomic interval.
+  `writeFASTA` reports `min(start)`..`max(end)` over the contributing chunks,
+  which is therefore a bounding box. Observed on real data: a header claiming
+  `85525676-215275966` (129.75 Mb) for **89 emitted bases** — a 1.46-million-fold
+  overstatement. Measured over 2,000 real regions (25,599 region x non-reference
+  species pairs): 77.8% `single`, 10.7% `contiguous`, 10.6% `split` (median gap
+  45 bp, max 335 Mb), 0.05% `multi_strand`, 0.8% `multi_scaffold`. So ~88.5% are
+  genuinely one locus and ~2.3% are not defensible as one.
+  `classifyChunks()` reports that classification and `--loci-table` emits the
+  per-chunk truth, so the indefensible cases can be filtered rather than
+  silently averaged into a span. **No gap threshold is hardcoded**, so the
+  number is reported and the judgment left to the analysis (same reasoning as
+  the advisory no-overlap thresholds).
+- **A split gap is NOT an indel the alignment absorbed.** An earlier draft of
+  this note claimed a 45 bp split was "a small indel, still the same locus";
+  the data disproves it. The aligner *does* thread query insertions inline as
+  reference-row gap columns, but only up to ~37 bp (156,928 such runs observed,
+  median 2, max 37, **zero at >=40**); past that it breaks the block instead.
+  Split gaps start at a median of 45 bp — immediately above that ceiling — so
+  they are sequence the aligner *declined to align*: real query bases silently
+  absent from the emitted FASTA while the bounding-box span still covers them.
+  Blocks tile the reference exactly (19,999/19,999 consecutive pairs adjacent,
+  zero gaps or overlaps), so a query jump at a boundary is purely query-side.
+  The consequence is exact, with zero exceptions across 27,599 records:
+  `single`/`contiguous` have header span == emitted bases and `split`/`multi_*`
+  never do — which is what makes the classification a usable filter. The
+  ~37 bp ceiling is an empirical property of this file's aligner and
+  parameters, not a MAF guarantee, so nothing hardcodes it.
+- **Splits are mostly shared, not lineage-specific.** At a given block boundary
+  the number of species jumping is bimodal: 33.3% of boundaries have exactly
+  one species, but 17% have 13-14 of 14. Where several jump, ~30% agree on gap
+  size to within 10 bp (a real case: six species at 33/34/33/33/33/33 — one
+  ancestral indel inherited by descent). Nearly-everyone-jumps most
+  parsimoniously means a reference-specific deletion, which makes the
+  *element's* reference definition the questionable thing rather than one
+  species' copy. `summarizeElementLoci()` reports this as
+  `split.max.boundary.n.species` vs `n.split`.
+- **Per-element classification lives in `maf_fetch_summary.tsv`, which is why
+  `trimMafBlock` returns chunks.** Classification is irreducibly per-species
+  (one real element was `contiguous` for 5 species, `split` for 6 and
+  `no_bases` for 3), but filtering a CNEE set needs a per-*element* verdict, and
+  that file is already one row per element. `trimMafBlock` was already computing
+  every trimmed `start`/`size`/`strand` to rewrite each `s` line and throwing
+  them away into the output text; returning them as a chunk list is what lets
+  the summary columns cover plain MAF output. Cost measured on 5,000 real
+  regions: **2.07s -> 2.21s (~6%)** in MAF mode, memory unchanged; FASTA mode
+  pays nothing new since it already accumulated chunks via `mafBlockToFasta`.
+  On real data 65.8% of elements are a clean single locus in all 15 species.
+  **One semantic difference to know:** for a MAF holding duplicate copies of a
+  species within one block, the MAF path counts every copy while the FASTA path
+  under `--fasta-dedupe most-seq` counts only the copy it kept. The production
+  file is `nodupes` (verified: zero repeated species across 20,000 blocks), so
+  the two agree there and the test suite asserts that equality.
+- **`classifyChunks` excludes zero-size chunks, and `no_bases` exists because
+  `single` used to lie.** A species can carry an `s` line in a block whose
+  aligned sequence falls entirely outside the requested region once trimmed,
+  leaving an all-gap FASTA row and a zero-width header span. 5.46% of real loci
+  rows are zero-size, and **1,648 of them classified as a clean `single`** with
+  `max_gap=0` — so filtering `single|contiguous` to build a per-species BED
+  would have silently admitted ~1,650 zero-width intervals. Zero-size chunks
+  also invented phantom gaps: a real case (`Dicrostonyx_torquatus`,
+  `CM000994.3:10038193`) had a zero-size chunk in block 1 and 27 real bases in
+  block 3, which measured as a 718 bp `split` from a chunk containing no bases.
+  Such chunks are now dropped from the gap/class arithmetic but still emitted
+  as loci rows, so nothing is hidden.
+- **Element-level and species-level filtering are very different yields; document
+  both.** The all-species filter (`n.split == n.multi.* == n.no.bases == 0`)
+  answers "is this element clean for everyone", which is what a concatenated
+  alignment needs -- 65.8% of elements on the 15-species rodent data. A
+  single-species product (e.g. a BED in one non-reference genome) should filter
+  that species' own rows in the loci table instead: 82-86% per species (mean
+  83.7%) on the same data, and 98.6% reported on a more fragmented 45-way bird
+  alignment. Using the strict filter for a single-species product discards most
+  of the usable data, so the README shows both.
+- **`interblock.distances` was removed; the check became a warning.** It
+  reported `next_ref_start - prev_ref_end` between consecutive blocks, which is
+  structurally zero on a normal MAF (19,999/19,999 consecutive pairs adjacent
+  on real data; the column read `NA`/`[0]`/`[0, 0]` and never anything else
+  across 2,000 real elements). Worse, it invited being read as a contiguity
+  check when it describes only the reference — the reference is contiguous by
+  construction while a species can jump kilobases at the same boundary, which
+  is the whole asymmetry the `split.*` columns exist to report. The computation
+  is retained and now raises a `ref-coverage-gap` warning when any distance is
+  non-zero, meaning the region holds reference positions no block covers (a
+  negative distance would mean blocks overlap in the reference, which should
+  not happen). Nothing is lost: `ref.block.bases` falls below `end - start` by
+  exactly the missing amount (verified: region width 9, `ref.block.bases` 3,
+  interblock distance `[6]`).
+- **`n.overlapping.blocks`/`block.lengths` became `ref.n.overlapping.blocks`/
+  `ref.block.bases`.** The prefix marks them as reference-side measurements so
+  they are not mistaken for per-species facts, and `block.lengths` was actively
+  misleading: the plural implied a list when it is a single sum. Note the
+  no-output accounting in `fetchByBatch` reads summary **field 4**
+  (`ref.n.overlapping.blocks`) positionally, which is unaffected by removing
+  field 6 — but it is positional, so check it if the leading columns ever move.
+- Documentation examples that filter these files now look columns up **by
+  name** rather than by position. A positional example had already gone stale
+  once (`$13=="single"` for the loci table, after `block_index`/`gap_to_next`
+  shifted `class` to column 15), which is exactly the failure the name-based
+  form prevents.
+- **Zero-size rows are a trap for consumers aggregating the loci table.** They
+  are emitted deliberately (nothing hidden) and excluded from `class`, so a
+  `single`-classified (element, species) can still carry a zero-size row --
+  *possibly on a different scaffold*. A real case: `lod=251` /
+  `Dicrostonyx_torquatus` has a zero-size chunk on `JAQHUG010000114.1` and 106
+  real bases on `JAQHUG010000001.1`, classified `single` (correctly). An awk
+  recipe that merged min/max across all rows without filtering `chunk_size > 0`
+  spanned both scaffolds and produced a 5.9 Mb interval for a ~250 bp element.
+  Any documented recipe must include the `chunk_size > 0` guard; the README's
+  does, and its output was verified against the reference element widths
+  (median 109 bp vs 129 bp reference, max 3,215 vs 3,213).
+- **Coordinates are reported exactly as the MAF states them, never converted.**
+  For `strand = -`, MAF's `start` counts in the reverse-complemented source; the
+  old code had an `if strand == "+": ... else: ...` whose branches were
+  **identical** and whose comment claimed forward-chromosome reporting it never
+  did. The dead branch is gone. Forward conversion was considered and
+  deliberately rejected: the sequence must stay exactly what was aligned (that
+  is what makes the columns homologous, and it feeds molecular-evolution
+  analysis), and two coexisting coordinate frames would be worse than one. The
+  loci table emits `src_size` instead, so forward coordinates are one
+  subtraction away (`src_size - (start+size)`, `src_size - start`) without
+  mafutils picking a frame.
+- **The FASTA dict key used to double as the header identity, which silently
+  dropped the scaffold.** `mafBlockToFasta` keyed records by `species` when
+  deduping (`use_species_keys = bool(expected_species) or fasta_dedupe != "none"`)
+  and by the full `species.scaffold` src otherwise — and `writeFASTA` built the
+  header from whatever the key was. So `-fh species-coords` emitted the scaffold
+  under `--fasta-dedupe none` but not under `most-seq`, making the same header
+  mode mean different things depending on unrelated flags, and making a
+  non-reference record unresolvable to a locus. `src`/`src_size` now travel
+  inside the record (swapped together with start/end/strand, so the copy dedupe
+  keeps is the one reported), the scaffold is built from the chunks via
+  `fastaScaffoldField()`, and multi-scaffold records comma-join their sources
+  rather than silently naming one. `species-only` stays bare on purpose — it
+  exists so headers match tree tip labels for phast/PhyloAcc.
+- `writeFASTA` assigned `id_str` inside `if region["id"]` but used it
+  unconditionally, so `-fh species-coords-id` with a 3-column BED (no name
+  column) died with `UnboundLocalError`. The id suffix is now appended only when
+  present.
 - The vendored `bgzf.BgzfReader` has no `.name` attribute (unlike `gzip.GzipFile`),
   so `fetch.py` gets the MAF's display filename from the known `maf_file`
   path (`WORKER_MAF_FILE`), not from the open file handle.

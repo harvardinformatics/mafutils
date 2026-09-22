@@ -67,6 +67,8 @@ import atexit
 import logging
 import bisect
 import time
+import statistics
+import tempfile
 import traceback
 from enum import Enum
 from types import SimpleNamespace
@@ -94,6 +96,7 @@ WORKER_SCAFFOLD_RUNS = None
 WORKER_OUTPUT = None
 WORKER_SINGLE_OUTPUT = None
 WORKER_SCAFFOLD_SUBDIRS = None
+WORKER_LOCI_TMP_DIR = None
 WORKER_AS_FASTA = None
 WORKER_FASTA_HEADER = None
 WORKER_EXPECTED_SPECIES = None
@@ -181,6 +184,7 @@ def initBatchWorker(
     scaffold_subdirs=False,
     index_file=None,
     scaffold_runs=None,
+    loci_tmp_dir=None,
 ):
     global WORKER_HEADER
     global WORKER_MAF_FILE
@@ -191,6 +195,7 @@ def initBatchWorker(
     global WORKER_OUTPUT
     global WORKER_SINGLE_OUTPUT
     global WORKER_SCAFFOLD_SUBDIRS
+    global WORKER_LOCI_TMP_DIR
     global WORKER_AS_FASTA
     global WORKER_FASTA_HEADER
     global WORKER_EXPECTED_SPECIES
@@ -212,6 +217,7 @@ def initBatchWorker(
     WORKER_OUTPUT = output
     WORKER_SINGLE_OUTPUT = single_output
     WORKER_SCAFFOLD_SUBDIRS = scaffold_subdirs
+    WORKER_LOCI_TMP_DIR = loci_tmp_dir
     WORKER_AS_FASTA = as_fasta
     WORKER_FASTA_HEADER = fasta_header
     WORKER_EXPECTED_SPECIES = expected_species
@@ -497,12 +503,25 @@ def getMAFHeader(maf_file, maf_compression):
 def speciesFromSrc(src):
     return src.split(".", 1)[0] if "." in src else src
 
+
+def scaffoldFromSrc(src):
+    """
+    The source-sequence part of a MAF "species.scaffold" src, or "" if the src
+    carries no scaffold at all. Mirrors gc.chromFromSrc, except that a src with
+    no "." yields "" rather than echoing the species back -- callers use this to
+    decide whether there is a scaffold to put in a header, and echoing the
+    species would produce "species.species".
+    """
+    return src.split(".", 1)[1] if "." in src else ""
+
 #############################################################################
 
 WARNING_LABELS = {
     "missing-scaffold": "missing-scaffold",
+    "multi-scaffold": "multi-scaffold",
     "multiple-strands": "multiple-strands",
     "no-overlap": "no-overlap",
+    "ref-coverage-gap": "ref-coverage-gap",
     "trim-mismatch": "trim-mismatch",
 }
 
@@ -728,24 +747,37 @@ def mafBlockToFasta(block_text, region, dedupe_mode="none", use_species_keys=Fal
             start = int(fields[2])
             size = int(fields[3])
             strand = fields[4]
-            #srcSize = fields[5]
+            src_size = int(fields[5])
             seq = fields[6]
             block_len = len(seq)
             key = species if use_species_keys else src
             nongap = sum(1 for c in seq if c != "-")
-            
-            # Compute 1-based closed interval for clarity (as in FASTA tools)
-            if strand == "+":
-                end = start + size
-            else:
-                # For negative strand, coordinates can be reported as on "forward" chromosome (for clarity, as in MAF)
-                end = start + size
+
+            # MAF-frame coordinates, reported exactly as the MAF states them:
+            # 0-based half-open [start, start+size). For strand "-" these count
+            # in the reverse-complemented source, which is MAF's convention --
+            # deliberately NOT converted to forward-genomic here. src_size is
+            # carried alongside so a consumer that wants forward coordinates can
+            # compute them (src_size - (start+size), src_size - start) without
+            # mafutils baking in that interpretation.
+            end = start + size
+
+            # scaffold/src_size travel WITH start/end/strand so that whichever
+            # copy dedupe keeps, its own source is the one reported. Previously
+            # the scaffold lived only in the dict key, so keying by species
+            # (--fasta-dedupe most-seq, or any --expected-species) discarded it
+            # entirely and the header could not name a locus.
+            record = {
+                'seq': seq, 'src': src, 'scaffold': scaffoldFromSrc(src),
+                'start': start, 'end': end, 'size': size, 'strand': strand,
+                'src_size': src_size, 'nongap': nongap,
+            }
 
             if key in fasta_lines and dedupe_mode == "most-seq":
                 if nongap > fasta_lines[key]["nongap"]:
-                    fasta_lines[key] = {'seq': seq, 'start': start, 'end': end, 'strand': strand, 'nongap': nongap}
+                    fasta_lines[key] = record
             elif key not in fasta_lines:
-                fasta_lines[key] = {'seq': seq, 'start': start, 'end': end, 'strand': strand, 'nongap': nongap}
+                fasta_lines[key] = record
             elif dedupe_mode == "none":
                 # Preserve previous behavior when dedupe is off by keeping src keys unique.
                 # If duplicate src appears, keep first occurrence.
@@ -759,39 +791,301 @@ def mafBlockToFasta(block_text, region, dedupe_mode="none", use_species_keys=Fal
 
 #############################################################################
 
-def writeFASTA(fasta_seqs, region, fasta_stream, BATCHLOG, fasta_header=False, verbose=False, warning_state=None):
+def classifyChunks(chunks):
+    """
+    Classifies what a species' contribution to one region actually is, from its
+    per-block chunks. Returns (class, max_gap).
 
-    fasta_output = {}
+    A MAF's blocks are contiguous in the REFERENCE only. A non-reference
+    species' chunks may be separated, inverted, or on different source
+    sequences, and stitching concatenates them without padding -- so a stitched
+    row is not necessarily one locus in that genome. Measured on real data
+    (2,000 regions, 15 species): 77.8% single, 10.7% contiguous, 10.6% split,
+    0.05% multi-strand, 0.8% multi-scaffold.
+
+    max_gap is the largest-magnitude gap between consecutive chunks (sorted by
+    start), reported SIGNED -- negative means chunks overlap in the source,
+    which indicates something different again (paralogy, tandem repeat). It is
+    0 for single/contiguous and None for multi_scaffold, where a gap between
+    positions on different sequences is meaningless.
+
+    A split gap is NOT an indel the alignment absorbed. The aligner threads
+    query insertions inline as reference-row gap columns, but only up to ~37bp
+    on real data (156,928 such runs observed, max 37, none >=40); past that it
+    breaks the block instead. So a gap between chunks is query sequence the
+    aligner *declined to align* -- real bases absent from the emitted FASTA
+    while the header's bounding-box span still covers them. Consequence,
+    verified with zero exceptions across 27,599 records: single/contiguous have
+    header span == emitted bases, and split/multi_* never do.
+
+    No gap threshold is applied on purpose: "how large a gap disqualifies a
+    locus" is a judgment for the analysis (real median split 45bp, max 335Mb),
+    so the number is reported and the caller decides.
+
+    Chunks contributing zero aligned bases are excluded from the gap/class
+    arithmetic: a species can have an s-line in a block whose aligned sequence
+    falls entirely outside the requested region once trimmed, leaving an
+    all-gap row. If NO chunk contributes bases the class is "no_bases" rather
+    than "single" -- 5.46% of real rows are zero-size, and 1,648 of them used
+    to report as a clean "single" with a zero-width header span.
+    """
+    if not chunks:
+        return "none", None
+
+    contributing = [c for c in chunks if c['size'] > 0]
+    if not contributing:
+        return "no_bases", 0
+    if len(contributing) == 1:
+        return "single", 0
+    if len({c['scaffold'] for c in contributing}) > 1:
+        return "multi_scaffold", None
+    if len({c['strand'] for c in contributing}) > 1:
+        return "multi_strand", None
+
+    ordered = sorted(contributing, key=lambda c: c['start'])
+    gaps = [
+        ordered[i + 1]['start'] - (ordered[i]['start'] + ordered[i]['size'])
+        for i in range(len(ordered) - 1)
+    ]
+    if all(g == 0 for g in gaps):
+        return "contiguous", 0
+    return "split", max(gaps, key=abs)
+
+
+def chunkGaps(chunks):
+    """
+    Signed gaps between a species' consecutive contributing chunks, in
+    ascending-start order. Shared by classifyChunks' caller and the per-element
+    summary so both see the same definition.
+    """
+    contributing = sorted((c for c in chunks if c['size'] > 0), key=lambda c: c['start'])
+    if len(contributing) < 2:
+        return []
+    if len({c['scaffold'] for c in contributing}) > 1 or len({c['strand'] for c in contributing}) > 1:
+        return []
+    return [
+        contributing[i + 1]['start'] - (contributing[i]['start'] + contributing[i]['size'])
+        for i in range(len(contributing) - 1)
+    ]
+
+
+ELEMENT_LOCI_HEADERS = [
+    "n.species", "n.single", "n.contiguous", "n.split",
+    "n.multi.scaffold", "n.multi.strand", "n.no.bases",
+    "split.bases.max", "split.gap.median",
+    "split.boundaries", "split.max.boundary.n.species",
+    "split.max.boundary.gap.spread",
+]
+
+
+def summarizeElementLoci(per_species_chunks):
+    """
+    Per-ELEMENT summary of how each species' contribution looks, as the values
+    for ELEMENT_LOCI_HEADERS.
+
+    Classification is irreducibly per-species -- one real element was
+    contiguous for 5 species, split for 6 and empty for 3 -- so this reports
+    counts per class plus the extent and the concentration of the splits,
+    leaving every threshold to the caller.
+
+    Extent needs two numbers, not one. A real element had a median gap of 63bp
+    across 13 split species but one species off by 335,617,958bp: the max alone
+    condemns an element where 12 species are nearly fine, the median alone
+    waves through a catastrophic misalignment.
+      - split.bases.max  : max over species of total unaligned bases, i.e.
+                           exactly (header span - aligned bases) for the worst
+                           species -- how much sequence its row is missing.
+      - split.gap.median : median of every individual gap in the element.
+
+    Concentration answers "is one shared event responsible?". Splits occur at
+    block boundaries, which are single reference positions, so species that
+    jump at the SAME boundary are jumping at the same place. Comparing
+    split.max.boundary.n.species to n.split distinguishes one ancestral indel
+    (equal, with a small gap spread -- a real 33/34/33/33/33 case gives spread
+    1) from independent lineage-specific events (much lower).
+
+    A species absent from a block inside its own span (1.6% of real multi-chunk
+    cases) has a gap spanning more than one boundary; it is attributed to the
+    first boundary it crosses, and the per-chunk loci table carries
+    block_index/gap_to_next so that case stays inspectable.
+    """
+    counts = {"single": 0, "contiguous": 0, "split": 0,
+              "multi_scaffold": 0, "multi_strand": 0, "no_bases": 0}
+    all_gaps = []
+    per_species_total = []
+    # boundary -> {species: gap}, keyed by the block ordinal the gap starts at
+    by_boundary = defaultdict(dict)
+
+    for species, chunks in per_species_chunks.items():
+        locus_class, _max_gap = classifyChunks(chunks)
+        if locus_class in counts:
+            counts[locus_class] += 1
+
+        gaps = chunkGaps(chunks)
+        nonzero = [g for g in gaps if g != 0]
+        if nonzero:
+            all_gaps.extend(nonzero)
+            per_species_total.append(sum(nonzero))
+            contributing = sorted((c for c in chunks if c['size'] > 0), key=lambda c: c['start'])
+            for i, gap in enumerate(gaps):
+                if gap != 0:
+                    by_boundary[contributing[i].get('block_index', i + 1)][species] = gap
+
+    if by_boundary:
+        busiest = max(by_boundary.values(), key=len)
+        boundary_n = len(busiest)
+        spread = max(busiest.values()) - min(busiest.values())
+    else:
+        boundary_n = 0
+        spread = 0
+
+    return [
+        len(per_species_chunks),
+        counts["single"], counts["contiguous"], counts["split"],
+        counts["multi_scaffold"], counts["multi_strand"], counts["no_bases"],
+        max(per_species_total) if per_species_total else 0,
+        int(statistics.median(all_gaps)) if all_gaps else 0,
+        len(by_boundary),
+        boundary_n,
+        spread,
+    ]
+
+
+def fastaScaffoldField(chunks):
+    """
+    The scaffold portion of a FASTA header, built from the chunks rather than
+    from the dict key. Distinct scaffolds are comma-joined in block order, so a
+    record stitched from two source sequences says so instead of silently
+    naming one of them. Returns "" when no chunk carries a scaffold.
+    """
+    seen = []
+    for c in chunks:
+        scaf = c.get('scaffold') or ""
+        if scaf and scaf not in seen:
+            seen.append(scaf)
+    return ",".join(seen)
+
+
+def writeFASTA(fasta_seqs, region, fasta_stream, BATCHLOG, fasta_header=False, verbose=False, warning_state=None, loci_stream=None):
+
     for sp, details in fasta_seqs.items():
+        chunks = details.get('chunks') or []
+        species = speciesFromSrc(sp)
+        locus_class, max_gap = classifyChunks(chunks)
+
         if fasta_header == "species-only":
-            header = f">{speciesFromSrc(sp)}"
+            # Deliberately bare: this mode exists so headers match tree tip
+            # labels for phast/PhyloAcc, so it never gains a scaffold.
+            header = f">{species}"
         else:
-            if details['starts'] and details['ends']:
-                region_start = min(details['starts'])
-                region_end = max(details['ends'])
+            if chunks:
+                region_start = min(c['start'] for c in chunks)
+                region_end = max(c['end'] for c in chunks)
             else:
                 region_start = region['start']
                 region_end = region['end']
-            strand = list(set(details['strands'])) if details['strands'] else ["."]
-            
-            if len(strand) == 1:
-                region_strand = strand[0]
+
+            strands = {c['strand'] for c in chunks if c['strand'] is not None}
+            if len(strands) == 1:
+                region_strand = next(iter(strands))
             else:
                 region_strand = "."
+                if len(strands) > 1:
+                    appendWarning(
+                        warning_state,
+                        "multiple-strands",
+                        f"Multiple strands found for species {sp} in region {region['scaffold']}:{region['start']}-{region['end']}. Using '.' in header.",
+                    )
+
+            # The scaffold comes from the chunks, not the dict key: keying by
+            # species (--fasta-dedupe most-seq / --expected-species) used to
+            # drop it entirely, so the header could not name a locus at all.
+            scaffold_field = fastaScaffoldField(chunks)
+            name = f"{species}.{scaffold_field}" if scaffold_field else species
+
+            if locus_class == "multi_scaffold":
                 appendWarning(
                     warning_state,
-                    "multiple-strands",
-                    f"Multiple strands found for species {sp} in region {region['scaffold']}:{region['start']}-{region['end']}. Using '.' in header.",
+                    "multi-scaffold",
+                    f"Species {species} in region {region['scaffold']}:{region['start']}-{region['end']} "
+                    f"is stitched from {len(set(c['scaffold'] for c in chunks))} source sequences "
+                    f"({scaffold_field}); its header coordinates are a bounding box, not a locus.",
                 )
 
+            # start-end is min..max over the contributing chunks -- a bounding
+            # box. It equals the emitted sequence's extent only when the chunks
+            # are contiguous (see classifyChunks); the loci table carries the
+            # per-chunk truth.
             if fasta_header == "species-coords":
-                header = f">{sp}:{region_start}-{region_end}({region_strand})"
-            elif fasta_header == "species-coords-id":
-                if "id" in region and region["id"]:
-                    id_str = f"id:{region['id']}"
-                header = f">{sp}:{region_start}-{region_end}({region_strand}) {id_str}"
+                header = f">{name}:{region_start}-{region_end}({region_strand})"
+            else:  # species-coords-id
+                header = f">{name}:{region_start}-{region_end}({region_strand})"
+                # A BED with no name column leaves region["id"] as None; this
+                # used to leave id_str unbound and crash with UnboundLocalError.
+                if region.get("id"):
+                    header += f" id:{region['id']}"
 
         fasta_stream.write(f"{header}\n{''.join(details['seq'])}\n")
+
+        if loci_stream is not None:
+            writeLociRows(loci_stream, region, species, chunks, locus_class, max_gap)
+
+
+LOCI_TABLE_HEADERS = [
+    "region_scaffold", "region_start", "region_end", "region_id",
+    "species", "src_scaffold", "src_size",
+    "chunk_start", "chunk_size", "chunk_strand",
+    "chunk_index", "n_chunks", "block_index", "gap_to_next",
+    "class", "max_gap",
+]
+
+
+def writeLociRows(loci_stream, region, species, chunks, locus_class, max_gap):
+    """
+    One row per (region, species, chunk), with the per-(region, species) class
+    denormalized onto each row so a single file serves both filtering and
+    per-species BED construction.
+
+    Coordinates are MAF-frame, exactly as the MAF states them; src_size is
+    included so forward-genomic coordinates are one subtraction away
+    (src_size - (start+size), src_size - start) without mafutils choosing a
+    frame on the caller's behalf.
+
+    block_index and gap_to_next make boundary identity explicit: a split
+    happens AT a block boundary, which is one reference position, so two
+    species sharing a block_index are interrupted at the same place. Together
+    they make per-boundary species counts and gap agreement derivable
+    downstream instead of frozen into the tool. Rows are ordered by
+    chunk_start, so a non-ascending block_index itself flags a chunk running
+    against the reference (7 of 3,744 real gaps).
+    """
+    gap_str = "." if max_gap is None else str(max_gap)
+    region_id = region.get("id") or "."
+    ordered = sorted(chunks, key=lambda c: c['start'])
+    gaps = chunkGaps(chunks)
+    n = len(ordered)
+    # chunkGaps only covers contributing (size>0) chunks on one scaffold/strand,
+    # so it is shorter than `ordered` whenever zero-size or heterogeneous chunks
+    # are present; those rows get "." rather than a misleading number.
+    contributing = [c for c in ordered if c['size'] > 0]
+    gap_by_start = {}
+    if len(gaps) == len(contributing) - 1:
+        for i, gap in enumerate(gaps):
+            gap_by_start[contributing[i]['start']] = gap
+
+    for i, c in enumerate(ordered, start=1):
+        gap_to_next = gap_by_start.get(c['start'])
+        loci_stream.write("\t".join([
+            region["scaffold"], str(region["start"]), str(region["end"]), region_id,
+            species, c.get('scaffold') or ".",
+            "." if c.get('src_size') is None else str(c['src_size']),
+            str(c['start']), str(c['size']), c.get('strand') or ".",
+            str(i), str(n),
+            str(c.get('block_index', i)),
+            "." if gap_to_next is None else str(gap_to_next),
+            locus_class, gap_str,
+        ]) + "\n")
+
 
 #############################################################################
 
@@ -804,9 +1098,15 @@ def trimMafBlock(block_text, bed_start, bed_end, BATCHLOG, verbose=False, warnin
     The MAF "s" line format:
         s <src> <start> <size> <strand> <srcSize> <aligned_sequence>
 
-    Returns the trimmed block as a string, or None if no overlap occurs.
+    Returns (trimmed_block_text, ref_info, chunks), or None if no overlap
+    occurs. `chunks` is one record per trimmed "s" line (species, scaffold,
+    trimmed start/size, strand, srcSize) -- every value already computed here
+    to rewrite the line, so collecting them costs no extra parsing. That is
+    what lets the per-element locus summary cover plain MAF output as well as
+    FASTA, which would otherwise need a second parse of every block.
     """
 
+    chunks = []
     lines = block_text.splitlines()
     if len(lines) < 2:
         return None  # Invalid block
@@ -886,6 +1186,15 @@ def trimMafBlock(block_text, bed_start, bed_end, BATCHLOG, verbose=False, warnin
             new_fields[3] = str(new_ref_size)
             new_fields[6] = ref_seq[ref_col_start:ref_col_end]
             trimmed_lines.append(" ".join(new_fields))
+            chunks.append({
+                'species': speciesFromSrc(fields[1]),
+                'scaffold': scaffoldFromSrc(fields[1]),
+                'start': new_ref_start,
+                'size': new_ref_size,
+                'end': new_ref_start + new_ref_size,
+                'strand': fields[4],
+                'src_size': int(fields[5]) if len(fields) > 5 and fields[5].isdigit() else None,
+            })
 
         else:
             species_seq = fields[6]
@@ -908,10 +1217,19 @@ def trimMafBlock(block_text, bed_start, bed_end, BATCHLOG, verbose=False, warnin
             new_fields[3] = str(trimmed_size)
             new_fields[6] = trimmed_seq
             trimmed_lines.append(' '.join(new_fields))
+            chunks.append({
+                'species': speciesFromSrc(fields[1]),
+                'scaffold': scaffoldFromSrc(fields[1]),
+                'start': new_start,
+                'size': trimmed_size,
+                'end': new_start + trimmed_size,
+                'strand': strand,
+                'src_size': int(fields[5]) if len(fields) > 5 and fields[5].isdigit() else None,
+            })
 
     #print(f"DEBUG: bed_interval=[{bed_start},{bed_end}), block_ref=[{block_ref_start},{block_ref_start + block_ref_size}), extracted_cols=[{ref_col_start}:{ref_col_end}], ref_seq_sample='{ref_seq[ref_col_start:ref_col_end] if ref_col_start is not None else 'None'}'", file=sys.stderr)
 
-    return "\n".join(trimmed_lines), [new_ref_start, new_ref_end, new_ref_size]
+    return "\n".join(trimmed_lines), [new_ref_start, new_ref_end, new_ref_size], chunks
 
 #############################################################################
 
@@ -945,6 +1263,7 @@ def fetchByRegion(
     warning_state=None,
     profile_state=None,
     scaffold_subdirs=False,
+    loci_stream=None,
 ):
     """
     Worker function to process a single BED region:
@@ -966,6 +1285,9 @@ def fetchByRegion(
 
     block_lengths = []  # Holds lengths of each block written
     block_stats = []  # Holds [new_ref_start, new_ref_end, new_ref_size] for each block
+    # species -> [chunk, ...] for this element, feeding summarizeElementLoci.
+    element_chunks = defaultdict(list)
+    block_ordinal = 0
     total_ref_bases = 0 # Total ref bases across all blocks
 
     if as_fasta:
@@ -993,7 +1315,9 @@ def fetchByRegion(
             "missing-scaffold",
             f"{scaffold}:{bed_start}-{bed_end} No index entries for scaffold.",
         )
-        summary = f"{region_str}\t0\t0\tNA\t0"
+        # Same column count as the normal path: no blocks means no species and
+        # no splits, so every element-locus column is zero.
+        summary = f"{region_str}\t0\t0\t0\t" + "\t".join(["0"] * len(ELEMENT_LOCI_HEADERS))
         return summary if not single_output else []
 
     blocks_written = 0
@@ -1030,7 +1354,23 @@ def fetchByRegion(
             addProfile(profile_state, "time_trim", time.perf_counter() - trim_timer_start)
         if trimmed_result is None:
             continue
-        trimmed, trimmed_info = trimmed_result
+        trimmed, trimmed_info, block_chunks = trimmed_result
+
+        # Accumulate per-species chunks for EVERY output format. On the FASTA
+        # path the authoritative records come from mafBlockToFasta below, which
+        # is dedupe-aware (the chunk must describe the copy --fasta-dedupe
+        # most-seq actually kept); here they come straight from the trimmer, so
+        # MAF output gets the same per-element locus summary at no extra
+        # parsing cost. NOTE the one semantic difference: for a MAF holding
+        # duplicate copies of a species in one block, this counts every copy
+        # while the FASTA path counts only the kept one.
+        block_ordinal += 1
+        if not as_fasta:
+            # Mutated in place rather than copied: trimMafBlock built these
+            # dicts fresh for this block and nothing else reads them.
+            for chunk in block_chunks:
+                chunk['block_index'] = block_ordinal
+                element_chunks[chunk.pop('species')].append(chunk)
 
         if not single_output and trimmed is not None:
             block_stats.append(trimmed_info)
@@ -1076,9 +1416,11 @@ def fetchByRegion(
                     if sp not in fasta_seqs:
                         # Backfill for all previous blocks
                         fasta_seqs[sp]['seq'] = [getFillString(fill_cache, "-", l) for l in block_lengths[:-1]]
-                        fasta_seqs[sp]['starts'] = []
-                        fasta_seqs[sp]['ends'] = []
-                        fasta_seqs[sp]['strands'] = []
+                        # One record per contributing block, in block order, as
+                        # the single source of truth: the header's coordinates,
+                        # its scaffold field, and the locus classification are
+                        # all derived from this rather than from parallel lists.
+                        fasta_seqs[sp]['chunks'] = []
 
                 # After establishing all species, append current block or pad as needed
                 for sp in species_order:
@@ -1088,13 +1430,22 @@ def fetchByRegion(
                         fill_char = "N" if sp in expected_species_set else "-"
                         seq = getFillString(fill_cache, fill_char, block_len)
                     fasta_seqs[sp]['seq'].append(seq)
-                    if sp in return_fasta_seqs:
-                        if return_fasta_seqs[sp]['start'] is not None:
-                            fasta_seqs[sp]['starts'].append(return_fasta_seqs[sp]['start'])
-                        if return_fasta_seqs[sp]['end'] is not None:
-                            fasta_seqs[sp]['ends'].append(return_fasta_seqs[sp]['end'])
-                        if return_fasta_seqs[sp]['strand'] is not None:
-                            fasta_seqs[sp]['strands'].append(return_fasta_seqs[sp]['strand'])
+                    rec = return_fasta_seqs.get(sp)
+                    # start is None for an --expected-species row that this
+                    # block filled with N's: it contributed no real sequence, so
+                    # it contributes no chunk.
+                    if rec is not None and rec.get('start') is not None:
+                        chunk = {
+                            'scaffold': rec.get('scaffold', ''),
+                            'start': rec['start'],
+                            'end': rec['end'],
+                            'size': rec.get('size', rec['end'] - rec['start']),
+                            'strand': rec.get('strand'),
+                            'src_size': rec.get('src_size'),
+                            'block_index': block_ordinal,
+                        }
+                        fasta_seqs[sp]['chunks'].append(chunk)
+                        element_chunks[speciesFromSrc(sp)].append(chunk)
                 if profile_state is not None:
                     addProfile(profile_state, "time_fasta_stitch", time.perf_counter() - stitch_timer_start)
             else:
@@ -1124,6 +1475,7 @@ def fetchByRegion(
             fasta_header=fasta_header,
             verbose=verbose,
             warning_state=warning_state,
+            loci_stream=loci_stream,
         )
         if profile_state is not None:
             addProfile(profile_state, "time_write_fasta", time.perf_counter() - write_timer_start)
@@ -1142,19 +1494,37 @@ def fetchByRegion(
         # Collect region info
         block_stats.sort()
         
+        # Consecutive blocks are expected to tile the reference exactly
+        # (verified on real data: 19,999/19,999 consecutive pairs adjacent), so
+        # this was reported as an all-zeros "interblock.distances" column that
+        # carried no information. It is a warning instead: a non-zero distance
+        # means the region contains reference bases with no alignment block, so
+        # ref.block.bases falls short of the region width and the extracted
+        # sequence is missing reference positions too. A negative distance would
+        # mean blocks overlap in the reference, which should not happen at all.
         interblock_spaces = [
             block_stats[i][0] - block_stats[i-1][1]
             for i in range(1, len(block_stats))
         ] if len(block_stats) > 1 else []
 
+        nonzero_spaces = [d for d in interblock_spaces if d != 0]
+        if nonzero_spaces:
+            appendWarning(
+                warning_state,
+                "ref-coverage-gap",
+                f"{scaffold}:{bed_start}-{bed_end} blocks do not tile the reference "
+                f"(inter-block distances {nonzero_spaces}); the region contains reference "
+                f"bases with no alignment block.",
+            )
+
         num_blocks = len(block_stats)
         blocks_length = sum(info[2] for info in block_stats)
-        space_str = str(interblock_spaces) if interblock_spaces else "NA"
         if profile_state is not None:
             profile_state["regions"] += 1
             addProfile(profile_state, "time_index_scan", time.perf_counter() - scan_timer_start)
             addProfile(profile_state, "time_region_total", time.perf_counter() - region_timer_start)
-        summary = (f"{region_str}\t{num_blocks}\t{blocks_length}\t{space_str}\t{len(species_order) if as_fasta else 'NA'}")
+        element_cols = "\t".join(str(v) for v in summarizeElementLoci(element_chunks))
+        summary = (f"{region_str}\t{num_blocks}\t{blocks_length}\t{len(species_order) if as_fasta else 'NA'}\t{element_cols}")
         return summary
 
     else:
@@ -1195,6 +1565,15 @@ def fetchByBatch(
     # to, by scaffold *name*) would break that: index scaffold order is MAF file
     # order, not alphabetical.
     index_fp = open(WORKER_INDEX_FILE, "r", encoding="utf-8")
+    # One loci file per BATCH, written straight to disk. Returning ~14 rows per
+    # region to the parent (as the region summary does) would not scale: a
+    # 979k-region run at 15 species is ~13.7M rows. The parent concatenates
+    # these in batch order -- see run_fetch.
+    loci_path = None
+    loci_fp = None
+    if WORKER_LOCI_TMP_DIR is not None:
+        loci_path = os.path.join(WORKER_LOCI_TMP_DIR, f"loci.task{batch_num}.tsv")
+        loci_fp = open(loci_path, "w", encoding="utf-8")
     scaffold_to_runs, runs, run_offsets = WORKER_SCAFFOLD_RUNS
     # Per-run resume points, so consecutive regions on a scaffold continue
     # forward through the index instead of rescanning from the run's start.
@@ -1241,6 +1620,7 @@ def fetchByBatch(
                 warning_state=warning_state,
                 profile_state=profile_state,
                 scaffold_subdirs=WORKER_SCAFFOLD_SUBDIRS,
+                loci_stream=loci_fp,
             )
 
             if scan_state and "resume" in scan_state:
@@ -1252,7 +1632,7 @@ def fetchByBatch(
 
             batch_results[result_idx] = region_result
             if not WORKER_SINGLE_OUTPUT:
-                # Field 4 is n.overlapping.blocks (see summary_headers). This
+                # Field 4 is ref.n.overlapping.blocks (see summary_headers). This
                 # used to read field 1, which is the region's START coordinate
                 # -- so every region beginning at coordinate 0 was counted as
                 # "no output" despite having been extracted fine, inflating
@@ -1269,6 +1649,8 @@ def fetchByBatch(
                         pass
     finally:
         index_fp.close()
+        if loci_fp is not None:
+            loci_fp.close()
 
     if profile_state is not None:
         profile_state["time_batch_total"] = time.perf_counter() - batch_timer_start
@@ -1279,6 +1661,7 @@ def fetchByBatch(
         "zero_overlap_regions": no_output_regions,
         "no_output_regions": no_output_regions,
         "batch_num": batch_num,
+        "loci_path": loci_path,
         "written_regions": written_regions,
         "warning_count": warning_state["count"],
         "warning_counts": warning_state["counts"],
@@ -1371,6 +1754,13 @@ def run_fetch(args, cmdline="mafutils fetch"):
         LOG.error(f"Invalid mode: '{args.mode}'. Must be 'block' or 'scaffold'.")
         sys.exit(1)
     # Validate mode
+
+    if args.loci_table and not args.fasta:
+        # The per-chunk records it reports are accumulated only on the FASTA
+        # stitching path; MAF output already carries species.scaffold in its
+        # s-lines, so nothing is missing there to reconstruct.
+        LOG.error("--loci-table requires --fasta (MAF output already carries species.scaffold in its s-lines).")
+        sys.exit(1)
 
     if args.scaffold_subdirs and args.single_output:
         LOG.error("--scaffold-subdirs cannot be used with --single-output.")
@@ -1677,6 +2067,9 @@ def run_fetch(args, cmdline="mafutils fetch"):
     missing_scaffold_regions = 0
     profile_totals = initProfileState() if args.profile else None
     profiled_batches = 0
+    loci_tmp = tempfile.TemporaryDirectory(prefix="maf_fetch_loci_", dir=args.output) if args.loci_table else None
+    loci_tmp_dir = loci_tmp.name if loci_tmp is not None else None
+    loci_paths = {}
     with ProcessPoolExecutor(
         max_workers=effective_processes,
         initializer=initBatchWorker,
@@ -1697,9 +2090,17 @@ def run_fetch(args, cmdline="mafutils fetch"):
             args.scaffold_subdirs,
             index_file,
             scaffold_runs,
+            loci_tmp_dir,
         ),
     ) as executor, open(info_outfile, "w") as info_out:
-        summary_headers = ["scaffold", "start", "end", "basename", "n.overlapping.blocks", "block.lengths", "interblock.distances", "n.sequences"]
+        # ref.* prefix marks the columns measured on the REFERENCE, so they are
+        # not mistaken for per-species facts: the reference is contiguous by
+        # construction while a species can jump kilobases at the same boundary
+        # (that asymmetry is what the n.*/split.* columns exist to report).
+        # ref.block.bases was "block.lengths", whose plural implied a list when
+        # it is a single sum; it falls below (end - start) exactly when the
+        # region has reference bases no block covers.
+        summary_headers = ["scaffold", "start", "end", "basename", "ref.n.overlapping.blocks", "ref.block.bases", "n.sequences"] + ELEMENT_LOCI_HEADERS
         info_out.write("\t".join(summary_headers) + "\n")
 
         futures = {}
@@ -1720,6 +2121,9 @@ def run_fetch(args, cmdline="mafutils fetch"):
                     profiled_batches += 1
                     for key, value in result["profile"].items():
                         profile_totals[key] += value
+
+                if result.get("loci_path"):
+                    loci_paths[result["batch_num"]] = result["loci_path"]
 
                 if not args.single_output:
                     for r in result["results"]:
@@ -1801,6 +2205,27 @@ def run_fetch(args, cmdline="mafutils fetch"):
             profile_totals["time_fasta_stitch"],
             profile_totals["time_write_fasta"],
         )
+
+    if loci_tmp is not None:
+        loci_outfile = os.path.join(args.output, "maf_fetch_loci.tsv")
+        rows = 0
+        with open(loci_outfile, "w", encoding="utf-8") as loci_out:
+            loci_out.write("\t".join(LOCI_TABLE_HEADERS) + "\n")
+            # Concatenate in BATCH-NUMBER order, not filename order: sorting the
+            # paths as strings would put task10 before task2 (the ordering bug
+            # just fixed in stats' writeBlockTable). Batches partition the
+            # index-ordered regions, so this keeps the table deterministic and
+            # in genomic order.
+            for batch_num in sorted(loci_paths):
+                path = loci_paths[batch_num]
+                if not os.path.isfile(path):
+                    continue
+                with open(path, "r", encoding="utf-8") as fp:
+                    for line in fp:
+                        loci_out.write(line)
+                        rows += 1
+        loci_tmp.cleanup()
+        LOG.info(f"Wrote {rows} loci row(s) to {loci_outfile}")
 
     if not args.single_output and missing_scaffold_regions > 0:
         # Advisory, like the other non-overlap outcomes: fetch is normally
@@ -1884,6 +2309,7 @@ def fetch_command(
     processes: Annotated[int, typer.Option("--processes", "-p", help="Number of parallel processes to use (default: 1)")] = 1,
     mode: Annotated[FetchMode, typer.Option("--mode", "-m", help="Mode: 'block' to trim by regions, 'scaffold' to extract whole scaffolds (default: block)")] = FetchMode.block,
     scaffold_subdirs: Annotated[bool, typer.Option("--scaffold-subdirs", help="Group output files into subfolders named by reference scaffold (<output>/<scaffold>/<basename>) instead of one flat directory.")] = False,
+    loci_table: Annotated[bool, typer.Option("--loci-table", help="Also write <output>/maf_fetch_loci.tsv: one row per region/species/contributing-block, with each species' source scaffold, MAF-frame coordinates, srcSize, and a locus classification (single/contiguous/split/multi_strand/multi_scaffold). Requires --fasta. Large: roughly (regions x species) rows.")] = False,
     single_output: Annotated[bool, typer.Option("--single-output", hidden=True)] = False,
     verbose: Annotated[bool, typer.Option("--verbose", help="Print every warning line after each batch completes.")] = False,
     profile: Annotated[bool, typer.Option("--profile", help="Log aggregate timing breakdowns for internal fetch steps.")] = False,
@@ -1903,6 +2329,7 @@ def fetch_command(
         processes=processes,
         mode=mode.value,
         scaffold_subdirs=scaffold_subdirs,
+        loci_table=loci_table,
         single_output=single_output,
         verbose=verbose,
         profile=profile,
