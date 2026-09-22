@@ -287,10 +287,37 @@ def deriveScaffoldIndexPath(maf_file):
 INDEX_HEADER_PREFIX = "# mafutils-index"
 
 
-def writeIndexHeader(stream, maf_file, compression, size, mtime, content_hash):
+# Aggregate counts recorded in the index header at build time, so `mafutils
+# info` can report them without reading anything but the header. Computed for
+# free while indexing (it already streams every block); an index that predates
+# them simply lacks the keys and consumers fall back to scanning.
+INDEX_AGGREGATE_KEYS = ("blocks", "scaffolds", "ref_bases", "aln_cols", "seq_lines", "max_seqs")
+
+
+def writeIndexHeader(stream, maf_file, compression, size, mtime, content_hash, aggregates=None):
+    """
+    Writes the one-line index header.
+
+    `aggregates` is an optional dict of INDEX_AGGREGATE_KEYS. The SAME values
+    must be written to both the block and scaffold index of a pair: `mafutils
+    validate` cross-checks the two headers with exact equality, so keys present
+    in only one would make every subsequent validate report MISMATCH. They
+    describe the MAF rather than the index file, so identical values in both is
+    also the semantically right thing.
+
+    Kept at format=2 deliberately: extra key=value tokens are additive and
+    readIndexHeader already parses arbitrary keys, with every consumer treating
+    a missing key as "can't check this dimension". Bumping the format would
+    imply an incompatibility that does not exist.
+    """
+    extra = ""
+    if aggregates:
+        extra = "".join(
+            f" {key}={aggregates[key]}" for key in INDEX_AGGREGATE_KEYS if key in aggregates
+        )
     stream.write(
         f"{INDEX_HEADER_PREFIX} format=2 maf={os.path.basename(maf_file)} "
-        f"compression={compression} size={size} mtime={mtime} hash={content_hash}\n"
+        f"compression={compression} size={size} mtime={mtime} hash={content_hash}{extra}\n"
     )
 
 
