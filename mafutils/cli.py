@@ -6,6 +6,7 @@ from . import __version__
 from . import fetch as fetch_mod
 from . import gc as gc_mod
 from . import index as index_mod
+from . import info as info_mod
 from . import stats as stats_mod
 from . import validate as validate_mod
 
@@ -19,6 +20,7 @@ app = typer.Typer(
 app.command("fetch", help="Fetch alignment blocks from a MAF using a BED file and an existing index.")(fetch_mod.fetch_command)
 app.command("gc", help="Calculate per-species GC content from a MAF file.")(gc_mod.gc_command)
 app.command("index", help="Create block and scaffold indexes for a MAF file.")(index_mod.index_command)
+app.command("info", help="Print a quick overview of a MAF file from its index.")(info_mod.info_command)
 app.command("stats", help="Summarize an indexed MAF at overall, species, and block levels.")(stats_mod.stats_command)
 app.command("validate", help="Check whether a MAF file's index is still trustworthy.")(validate_mod.validate_command)
 

@@ -28,6 +28,30 @@ for user-facing installation/usage docs.
   missing or headerless), even when the block index matches the MAF file
   perfectly.
 
+- **The index header carries aggregate counts, and both files of a pair must
+  get the identical set.** `mafutils index` accumulates blocks / scaffolds /
+  ref_bases / aln_cols / seq_lines / max_seqs in its existing block loop and
+  writes them as extra `key=value` tokens, so `mafutils info` can report them
+  from one line instead of rescanning. Two constraints:
+  `validate` compares the block and scaffold headers with **exact equality**
+  (`validate.py`), so block-only keys would make every future validate report
+  MISMATCH -- the same dict goes into both. And the format stays at **2**:
+  the change is purely additive, `readIndexHeader` already parses arbitrary
+  keys, and `tests/test_validate.py` asserts `format == "2"`.
+  `process_maf_block` returns the integers alongside its stringified row so the
+  loop never int()s its own output back again; measured cost of the whole
+  change on a 1.5GB slice, 3 runs each: **4.71s -> 4.77s (~1.3%)**, and a full
+  42.7GB rebuild produced aggregates matching an independent awk pass exactly
+  (`blocks=8094203 scaffolds=61 ref_bases=2728222451 aln_cols=3031569326
+  seq_lines=103950448 max_seqs=15`) with all 8.09M rows byte-identical.
+- **`mafutils info` never scans the MAF for counts.** Header first; failing
+  that, stream the *index* (~52 MB/s) with a warning naming its size; failing
+  that, report only what needs no index. Species are the exception and are
+  always labelled a sample -- they are not in the index, and collecting them at
+  index time costs 2.06x (0.79s -> 1.62s per 1.5GB), which would undo most of
+  the v0.6.0 speedup. Verified end to end: 1.3s on the 42.7GB file, and the
+  fallback's scanned values equal the header's exactly.
+
 ## Compression / index internals
 
 - **`mafutils/lib/bgzf.py` is vendored from Biopython, not a dependency.**

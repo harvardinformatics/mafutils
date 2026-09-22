@@ -17,12 +17,22 @@ from mafutils.lib import common as COMMON
 
 
 def process_maf_block(block):
+    """
+    Returns (row, ref_len, aln_cols, num_seqs) for one block: the index row as
+    strings, plus the three integers the header aggregates need.
+
+    The integers are returned rather than re-parsed from `row` on purpose --
+    this loop runs once per block (233M times on a whole-genome MAF) and is the
+    hot path the v0.6.0 indexing speedup optimised, so int()-ing its own output
+    back again would be a needless per-block cost.
+    """
     ref_seq = block[1].split()
     ref_scaff = ref_seq[1].split(".", 1)[1]
     line_len = str(len(block[1]))
-    num_seqs = str(len(block) - 1)
-    seq_len = str(len(ref_seq[6]))
-    return [ref_scaff, ref_seq[2], ref_seq[3], seq_len, line_len, num_seqs]
+    num_seqs = len(block) - 1          # every s line, including the reference
+    seq_len = len(ref_seq[6])          # block width, gap columns included
+    row = [ref_scaff, ref_seq[2], ref_seq[3], str(seq_len), line_len, str(num_seqs)]
+    return row, int(ref_seq[3]), seq_len, num_seqs
 
 
 def run_index(maf_file, block_index_path, scaffold_index_path):
@@ -52,9 +62,26 @@ def run_index(maf_file, block_index_path, scaffold_index_path):
             # (see iterMafBlocks/openMafHashing).
             use_binary = maf_compression in ("none", "gz")
 
+            # Header aggregates, accumulated as we go so `mafutils info` can
+            # report them later from the header alone rather than rescanning.
+            n_blocks = 0
+            total_ref_bases = 0
+            total_aln_cols = 0
+            total_seq_lines = 0
+            max_seqs = 0
+            distinct_scaffolds = set()
+
             for block, block_start, block_end in COMMON.iterMafBlocks(maf_stream, binary=use_binary):
-                block_info = process_maf_block(block)
+                block_info, ref_len, aln_cols, num_seqs = process_maf_block(block)
                 ref_scaffold = block_info[0]
+
+                n_blocks += 1
+                total_ref_bases += ref_len
+                total_aln_cols += aln_cols
+                total_seq_lines += num_seqs
+                if num_seqs > max_seqs:
+                    max_seqs = num_seqs
+                distinct_scaffolds.add(ref_scaffold)
 
                 mdx_line = block_info + [str(block_start), str(block_end)]
                 block_stream.write("\t".join(mdx_line) + "\n")
@@ -76,13 +103,24 @@ def run_index(maf_file, block_index_path, scaffold_index_path):
 
         content_hash = f"md5:{hash_obj.hexdigest()}"
 
+        # Identical in both headers on purpose -- validate cross-checks the two
+        # for exact equality, and these describe the MAF, not the index file.
+        aggregates = {
+            "blocks": n_blocks,
+            "scaffolds": len(distinct_scaffolds),
+            "ref_bases": total_ref_bases,
+            "aln_cols": total_aln_cols,
+            "seq_lines": total_seq_lines,
+            "max_seqs": max_seqs,
+        }
+
         with open(block_index_path, "w") as block_stream:
-            COMMON.writeIndexHeader(block_stream, maf_file, maf_compression, size, mtime, content_hash)
+            COMMON.writeIndexHeader(block_stream, maf_file, maf_compression, size, mtime, content_hash, aggregates)
             with open(block_tmp_path, "r") as tmp_fp:
                 shutil.copyfileobj(tmp_fp, block_stream)
 
         with open(scaffold_index_path, "w") as scaffold_stream:
-            COMMON.writeIndexHeader(scaffold_stream, maf_file, maf_compression, size, mtime, content_hash)
+            COMMON.writeIndexHeader(scaffold_stream, maf_file, maf_compression, size, mtime, content_hash, aggregates)
             with open(scaffold_tmp_path, "r") as tmp_fp:
                 shutil.copyfileobj(tmp_fp, scaffold_stream)
 
