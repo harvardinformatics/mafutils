@@ -20,7 +20,7 @@ This project was developed with significant assistance from large language model
 
 `mafutils/lib/bgzf.py` is vendored from [Biopython](https://biopython.org/)
 (BSD 3-Clause License option) rather than pulled in as a dependency — see the
-notice at the top of that file and [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md)
+notice at the top of that file and [`THIRD_PARTY_LICENSES.md`](https://github.com/harvardinformatics/mafutils/blob/main/THIRD_PARTY_LICENSES.md)
 for full attribution and license text.
 
 ## Installation
@@ -110,7 +110,7 @@ If you plan to use `--processes > 1` against compressed input, compress with
 
 **No extra dependency for bgzip:** BGZF support is vendored in
 `mafutils/lib/bgzf.py` rather than depending on the `biopython` package —
-see `DEVELOPMENT.md` for why, and [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md)
+see `DEVELOPMENT.md` for why, and [`THIRD_PARTY_LICENSES.md`](https://github.com/harvardinformatics/mafutils/blob/main/THIRD_PARTY_LICENSES.md)
 for attribution.
 
 ## Index Integrity
@@ -297,7 +297,7 @@ bounding box over chunks that are separated, on both strands, or on different
 scaffolds.
 
 For background on these classes, filtering recipes, and an example of building
-a per-species BED, see [docs/fetch-outputs.md](docs/fetch-outputs.md).
+a per-species BED, see [docs/fetch-outputs.md](https://github.com/harvardinformatics/mafutils/blob/main/docs/fetch-outputs.md).
 
 ### `maf_fetch_summary.tsv`
 
@@ -538,4 +538,4 @@ verdict. Exit codes:
 ## Notes
 
 For development setup (installing from a source checkout), running the test
-suite, and internal implementation notes, see [`DEVELOPMENT.md`](DEVELOPMENT.md).
+suite, and internal implementation notes, see [`DEVELOPMENT.md`](https://github.com/harvardinformatics/mafutils/blob/main/DEVELOPMENT.md).
