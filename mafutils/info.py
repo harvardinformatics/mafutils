@@ -43,17 +43,6 @@ SPECIES_PREVIEW = 20
 #############################################################################
 
 
-def humanBytes(n):
-    """
-    Decimal units, so "GB" means 10^9 bytes and the printed number matches the
-    `size=` field in the index header rather than being 7% smaller.
-    """
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1000 or unit == "TB":
-            return f"{n:.2f} {unit}" if unit != "B" else f"{n} B"
-        n /= 1000
-
-
 def readAggregates(header):
     """
     Pulls the aggregate counts out of a parsed index header, or None if this
@@ -161,7 +150,7 @@ def run_info(args, LOG):
         LOG.warning(
             "Index predates the aggregate header fields; computing block stats by "
             "scanning the index (%s). Rebuild with `mafutils index` to make this instant.",
-            humanBytes(index_size),
+            COMMON.humanBytes(index_size),
         )
         aggregates = scanIndexAggregates(index_file)
 
@@ -187,7 +176,7 @@ def run_info(args, LOG):
     size = os.path.getsize(args.maf_file)
     out = []
     out.append(f"{'MAF':<15}: {os.path.basename(args.maf_file)}")
-    out.append(f"{'size':<15}: {humanBytes(size)} ({maf_compression})")
+    out.append(f"{'size':<15}: {COMMON.humanBytes(size)} ({maf_compression})")
 
     if not have_index:
         out.append(f"{'index':<15}: not found at {index_file}")

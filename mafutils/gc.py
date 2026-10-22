@@ -51,6 +51,7 @@ import typer
 
 from mafutils.lib import common as COMMON
 from mafutils.lib import loginit as LOGINIT
+from mafutils.lib import options as OPTIONS
 
 #############################################################################
 
@@ -154,13 +155,26 @@ def chunker(iterable, size):
 #############################################################################
 
 
-def runSequentialGC(maf_file, maf_compression, LOG):
+def runSequentialGC(maf_file, maf_compression, LOG, progress_interval=COMMON.PROGRESS_INTERVAL_SECONDS):
     counts = defaultdict(newBaseCounts)
+
+    # No block total without the index, so progress is position in the file
+    # on disk. Checked on "a" lines only, every PROGRESS_CHECK_BLOCKS blocks,
+    # so the s lines -- nearly all of the loop -- pay nothing for it; with
+    # --progress-interval 0 the "a" lines skip it too.
+    LOG.info(COMMON.progressStartupLine(progress_interval))
+    progress = COMMON.ByteProgress(LOG, os.path.getsize(maf_file), interval=progress_interval)
+    report_progress = progress.enabled
+    n_blocks = 0
 
     with COMMON.openMaf(maf_file, maf_compression, "rt") as maf_fp:
         for line in maf_fp:
             if line.startswith("s"):
                 updateCountsFromSeqLine(line, counts)
+            elif report_progress and line.startswith("a"):
+                n_blocks += 1
+                if n_blocks % COMMON.PROGRESS_CHECK_BLOCKS == 0:
+                    progress.updateTo(COMMON.diskPosition(maf_fp))
 
     return counts
 
@@ -196,9 +210,13 @@ def mergeCountsInto(target, counts):
         m["T"] += rec["T"]
 
 
-def runParallelGC(maf_file, maf_compression, index_file, processes, chunk_size, LOG, verify_hash=False):
+def runParallelGC(maf_file, maf_compression, index_file, processes, chunk_size, LOG, verify_hash=False,
+                  progress_interval=COMMON.PROGRESS_INTERVAL_SECONDS):
     LOG.info(f"Streaming index file: {index_file}")
-    COMMON.validateIndexHeader(COMMON.readIndexHeader(index_file), maf_file, maf_compression, LOG, strict=verify_hash)
+    index_header = COMMON.readIndexHeader(index_file)
+    COMMON.validateIndexHeader(index_header, maf_file, maf_compression, LOG, strict=verify_hash)
+    header_blocks = COMMON.headerBlockCount(index_header, LOG, progress=progress_interval > 0)
+    LOG.info(COMMON.progressStartupLine(progress_interval))
 
     LOG.info(f"Streaming index in chunks of {chunk_size} blocks across {processes} process(es).")
 
@@ -213,6 +231,7 @@ def runParallelGC(maf_file, maf_compression, index_file, processes, chunk_size, 
     total_blocks = 0
     tasks_done = 0
     chunk_iter = enumerate(chunker(iterIndexEntries(index_file, LOG), chunk_size), start=1)
+    progress = COMMON.BlockProgress(LOG, header_blocks, interval=progress_interval)
 
     with ProcessPoolExecutor(max_workers=processes) as executor:
         in_flight = {}
@@ -224,20 +243,31 @@ def runParallelGC(maf_file, maf_compression, index_file, processes, chunk_size, 
             for future in done:
                 # Merge as results arrive, then drop them, so peak memory is
                 # one accumulator plus the in-flight chunks.
-                total_blocks += in_flight.pop(future)
+                n_blocks = in_flight.pop(future)
+                total_blocks += n_blocks
                 mergeCountsInto(merged, future.result())
                 tasks_done += 1
+                progress.update(n_blocks)
 
         for future in in_flight:
             total_blocks += in_flight[future]
             mergeCountsInto(merged, future.result())
             tasks_done += 1
+            progress.update(in_flight[future])
 
     if not total_blocks:
         LOG.error("No valid index entries found.")
         sys.exit(1)
 
     LOG.info(f"Processed {total_blocks} indexed blocks in {tasks_done} task(s).")
+    if header_blocks is not None and total_blocks != header_blocks:
+        # Same check as stats: both come from one `mafutils index` run, so they
+        # only disagree if the index was truncated or edited.
+        LOG.warning(
+            f"Processed {total_blocks:,} blocks but the index header records "
+            f"{header_blocks:,}. The index rows and header disagree, so this GC content may "
+            f"not cover the whole MAF; rebuild the index with `mafutils index`."
+        )
     return merged
 
 
@@ -304,8 +334,9 @@ def run_gc(args, cmdline="mafutils gc"):
 
     LOG.info(f"mafutils gc called as: {cmdline}")
     LOG.info("-" * 40)
+    arg_width = max(len(arg) for arg in vars(args))
     for arg, value in vars(args).items():
-        LOG.info(f"{arg:16} : {value}")
+        LOG.info(f"{arg:{arg_width}} : {value}")
     LOG.info("-" * 40)
 
     if args.processes < 1:
@@ -347,11 +378,11 @@ def run_gc(args, cmdline="mafutils gc"):
         LOG.info(f"Running in PARALLEL mode ({maf_compression} MAF + index + processes > 1)")
         counts = runParallelGC(
             args.maf_file, maf_compression, index_file, args.processes, args.chunk_size, LOG,
-            verify_hash=args.verify_hash,
+            verify_hash=args.verify_hash, progress_interval=args.progress_interval,
         )
     else:
         LOG.info("Running in SEQUENTIAL mode")
-        counts = runSequentialGC(args.maf_file, maf_compression, LOG)
+        counts = runSequentialGC(args.maf_file, maf_compression, LOG, progress_interval=args.progress_interval)
 
     species_gc = computeSpeciesGC(counts, LOG)
     if not species_gc:
@@ -384,6 +415,7 @@ def gc_command(
     chunk_size: Annotated[int, typer.Option("--chunk-size", help="Blocks per worker task in parallel mode (default: 5000)")] = 5000,
     verify_hash: Annotated[bool, typer.Option("--verify-hash", help="Verify the index's stored content hash against the MAF file (reads the whole file; only checked when an index is actually used).")] = False,
     log_level: Annotated[LogLevel, typer.Option("--log-level", help="Logging level (default: INFO)")] = LogLevel.INFO,
+    progress_interval: OPTIONS.ProgressIntervalOption = COMMON.PROGRESS_INTERVAL_SECONDS,
 ) -> None:
     args = SimpleNamespace(
         maf_file=maf_file,
@@ -393,6 +425,7 @@ def gc_command(
         chunk_size=chunk_size,
         verify_hash=verify_hash,
         log_level=log_level.value,
+        progress_interval=progress_interval,
     )
     cmdline = "mafutils gc"
     if len(sys.argv) > 2:

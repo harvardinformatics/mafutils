@@ -13,6 +13,8 @@ produced by `mafutils index`.
 Outputs:
     <prefix>.overall.tsv  : one metric per line
     <prefix>.species.tsv  : one row per species
+    <prefix>.species_scaffolds.tsv : one row per (species, source scaffold)
+                            present in the MAF -- not the whole assembly
     <prefix>.block.tsv    : one row per block (optional; default enabled)
     <prefix>.dashboard.html : self-contained summary dashboard (optional)
 
@@ -42,6 +44,7 @@ import typer
 
 from mafutils.lib import common as COMMON
 from mafutils.lib import loginit as LOGINIT
+from mafutils.lib import options as OPTIONS
 
 #############################################################################
 
@@ -140,8 +143,44 @@ def speciesFromSrc(src):
     return src
 
 
+class SrcSizeConflictError(ValueError):
+    """Raised when one species.scaffold reports two different srcSize values."""
+
+
+def reconcileSrcSize(key, known, incoming):
+    """
+    Combines two srcSize observations for the same (species, scaffold).
+
+    srcSize is the scaffold's full length in its assembly, so every s line for
+    one species.scaffold must agree. Disagreement means an internally
+    inconsistent MAF and is raised rather than resolved: picking either value
+    would be a silent fallback, and "whichever was seen first" would also make
+    the output depend on how blocks were split across workers. (Measured on
+    real data: zero conflicts across 2,647 scaffolds / 500,000 blocks.)
+
+    None means "this line's srcSize did not parse" and never conflicts.
+    """
+    if known is None:
+        return incoming
+    if incoming is None or incoming == known:
+        return known
+    species, scaffold = key
+    raise SrcSizeConflictError(
+        f"{species}.{scaffold} has conflicting srcSize values ({known} and {incoming}); "
+        f"the MAF is internally inconsistent, so its scaffold lengths cannot be reported."
+    )
+
+
 def parseBlock(block_text):
     species_stats = defaultdict(lambda: {"copies": 0, "gaps": 0, "nongaps": 0})
+    # (species, scaffold) -> {"src_size", "aligned_bases"} for this block.
+    # Collected here because this loop already splits every s line, so the
+    # scaffold name and srcSize (fields[1], fields[5]) are already in hand --
+    # unlike `mafutils index`, which deliberately never parses non-reference
+    # lines and would pay ~2x to collect them. Keyed by species AND scaffold:
+    # same-named scaffolds in different species are different sequences.
+    scaffold_stats = {}
+    scaffold_size_parse_errors = 0
     all_gap_species = set()
     present_species = set()
     n_seq_lines = 0
@@ -158,7 +197,9 @@ def parseBlock(block_text):
         if len(fields) < 7:
             parse_errors += 1
             continue
-        sp = speciesFromSrc(fields[1])
+        # One partition yields both halves; the species half is identical to
+        # speciesFromSrc(), so existing per-species statistics are unchanged.
+        sp, _dot, scaffold = fields[1].partition(".")
         seq = fields[6]
         gaps = seq.count("-")
         nongaps = len(seq) - gaps
@@ -170,6 +211,23 @@ def parseBlock(block_text):
         rec["copies"] += 1
         rec["gaps"] += gaps
         rec["nongaps"] += nongaps
+
+        # A non-integer srcSize affects ONLY the scaffold table: this line has
+        # already been counted toward every existing statistic above, exactly
+        # as before (which never read fields[5]). Its scaffold is still
+        # recorded, without a size, and the failure is counted -- not hidden.
+        try:
+            src_size = int(fields[5])
+        except ValueError:
+            src_size = None
+            scaffold_size_parse_errors += 1
+        key = (sp, scaffold)
+        srec = scaffold_stats.get(key)
+        if srec is None:
+            scaffold_stats[key] = {"src_size": src_size, "aligned_bases": nongaps}
+        else:
+            srec["aligned_bases"] += nongaps
+            srec["src_size"] = reconcileSrcSize(key, srec["src_size"], src_size)
 
     for sp, rec in species_stats.items():
         if rec["nongaps"] == 0:
@@ -211,6 +269,8 @@ def parseBlock(block_text):
 
     return {
         "species_stats": species_stats,
+        "scaffold_stats": scaffold_stats,
+        "scaffold_size_parse_errors": scaffold_size_parse_errors,
         "present_species": present_species,
         "all_gap_species": all_gap_species,
         "n_seq_lines": n_seq_lines,
@@ -258,6 +318,7 @@ def workerTask(
         "total_gap_chars": 0,
         "total_cells": 0,
         "total_parse_errors": 0,
+        "scaffold_size_parse_errors": 0,
         "blocks_with_zero_parsed_seq_lines_but_index_nonzero": 0,
         "all_gap_sites": 0,
         "invariant_sites": 0,
@@ -278,6 +339,9 @@ def workerTask(
         }
     )
     observed_species = set()
+    # (species, scaffold) -> {"src_size", "blocks", "aligned_bases"} for this
+    # chunk; merged into the run-wide accumulator as each chunk completes.
+    scaffolds = {}
 
     block_tmp = None
     block_tmp_path = None
@@ -324,6 +388,20 @@ def workerTask(
                 overall["blocks_with_zero_parsed_seq_lines_but_index_nonzero"] += 1
 
             observed_species.update(parsed["present_species"])
+
+            overall["scaffold_size_parse_errors"] += parsed["scaffold_size_parse_errors"]
+            for key, srec in parsed["scaffold_stats"].items():
+                crec = scaffolds.get(key)
+                if crec is None:
+                    scaffolds[key] = {
+                        "src_size": srec["src_size"],
+                        "blocks": 1,
+                        "aligned_bases": srec["aligned_bases"],
+                    }
+                else:
+                    crec["blocks"] += 1
+                    crec["aligned_bases"] += srec["aligned_bases"]
+                    crec["src_size"] = reconcileSrcSize(key, crec["src_size"], srec["src_size"])
 
             for sp, rec in parsed["species_stats"].items():
                 s = species[sp]
@@ -373,6 +451,7 @@ def workerTask(
         "overall": overall,
         "species": dict(species),
         "observed_species": sorted(observed_species),
+        "scaffolds": scaffolds,
         "block_tmp_path": block_tmp_path,
     }
 
@@ -401,6 +480,10 @@ def newStatsAccumulator():
         ),
         "observed_species": set(),
         "block_tmp_paths": [],
+        # (species, scaffold) -> {"src_size", "blocks", "aligned_bases"}.
+        # Bounded by the number of distinct scaffolds, not by blocks: 1,587
+        # pairs measured at ~0.1MB over 200,000 real blocks.
+        "scaffolds": {},
     }
 
 
@@ -419,6 +502,16 @@ def mergeStatsInto(acc, res):
         for k, v in rec.items():
             s[k] += v
     acc["observed_species"].update(res["observed_species"])
+    scaffolds = acc["scaffolds"]
+    for key, crec in res["scaffolds"].items():
+        arec = scaffolds.get(key)
+        if arec is None:
+            scaffolds[key] = dict(crec)
+        else:
+            arec["blocks"] += crec["blocks"]
+            arec["aligned_bases"] += crec["aligned_bases"]
+            # Raises on a genuine conflict; see reconcileSrcSize.
+            arec["src_size"] = reconcileSrcSize(key, arec["src_size"], crec["src_size"])
     if res["block_tmp_path"]:
         # Keyed by task_id so the per-chunk block rows can be concatenated in
         # index order. Results arrive out of order in the parallel path, and
@@ -453,6 +546,10 @@ def writeOverall(out_path, overall, n_species_total):
             "blocks_with_zero_parsed_seq_lines_but_index_nonzero",
             int(overall["blocks_with_zero_parsed_seq_lines_but_index_nonzero"]),
         ),
+        # s lines whose srcSize did not parse as an integer. Affects only the
+        # species_scaffolds table (those scaffolds are reported without a
+        # size); every other statistic counted the line as before.
+        ("scaffold_size_parse_errors", int(overall["scaffold_size_parse_errors"])),
     ]
 
     with open(out_path, "w", encoding="utf-8") as fp:
@@ -464,7 +561,28 @@ def writeOverall(out_path, overall, n_species_total):
                 fp.write(f"{key}\t{val}\n")
 
 
-def writeSpecies(out_path, species, total_blocks):
+def speciesScaffoldRollup(scaffolds):
+    """
+    species -> (scaffolds_in_maf, scaffold_bases_in_maf).
+
+    Both are limited to scaffolds PRESENT IN THE MAF, i.e. with at least one
+    aligned s line. A scaffold that never aligns to the reference never
+    appears, so these are lower bounds on the assembly's scaffold count and
+    size -- while also over-counting relative to aligned bases, since a
+    barely-aligned scaffold contributes its full srcSize. Scaffolds whose
+    srcSize failed to parse are counted but contribute no bases.
+    """
+    rollup = defaultdict(lambda: [0, 0])
+    for (species, _scaffold), rec in scaffolds.items():
+        r = rollup[species]
+        r[0] += 1
+        if rec["src_size"] is not None:
+            r[1] += rec["src_size"]
+    return rollup
+
+
+def writeSpecies(out_path, species, total_blocks, scaffolds=None):
+    rollup = speciesScaffoldRollup(scaffolds or {})
     header = [
         "species",
         "blocks_present",
@@ -479,6 +597,11 @@ def writeSpecies(out_path, species, total_blocks):
         "avg_gaps_per_present_block",
         "avg_gap_fraction_per_present_block",
         "all_gap_blocks",
+        # Appended last so positional parsers of species.tsv keep working.
+        # "_in_maf" because these are NOT assembly properties -- see
+        # speciesScaffoldRollup.
+        "scaffolds_in_maf",
+        "scaffold_bases_in_maf",
     ]
     with open(out_path, "w", encoding="utf-8") as fp:
         fp.write("\t".join(header) + "\n")
@@ -503,10 +626,51 @@ def writeSpecies(out_path, species, total_blocks):
                         f"{(rec['gaps_total'] / blocks_present) if blocks_present else 0.0:.8f}",
                         f"{(rec['gap_pct_block_sum'] / blocks_present) if blocks_present else 0.0:.8f}",
                         str(int(rec["all_gap_blocks"])),
+                        str(rollup[sp][0]) if sp in rollup else "0",
+                        str(rollup[sp][1]) if sp in rollup else "0",
                     ]
                 )
                 + "\n"
             )
+
+
+SPECIES_SCAFFOLD_HEADERS = [
+    "species", "scaffold", "src_size", "blocks", "aligned_bases", "aligned_fraction",
+]
+
+
+def writeSpeciesScaffolds(out_path, scaffolds):
+    """
+    One row per (species, scaffold) present in the MAF, sorted by species then
+    src_size descending (largest scaffolds first).
+
+    src_size is the scaffold's true full length in its assembly (MAF srcSize),
+    but only scaffolds with at least one aligned s line appear at all -- the
+    table is complete over the MAF, not over the assembly.
+
+    aligned_fraction is deliberately not clamped: a region aligned into several
+    blocks (duplicated/paralogous alignments) can push it above 1.0, which is
+    information rather than an error. It is "." when src_size did not parse or
+    is zero.
+    """
+    def sort_key(item):
+        (species, scaffold), rec = item
+        size = rec["src_size"] if rec["src_size"] is not None else -1
+        return (species, -size, scaffold)
+
+    with open(out_path, "w", encoding="utf-8") as fp:
+        fp.write("\t".join(SPECIES_SCAFFOLD_HEADERS) + "\n")
+        for (species, scaffold), rec in sorted(scaffolds.items(), key=sort_key):
+            size = rec["src_size"]
+            fraction = f"{rec['aligned_bases'] / size:.8f}" if size else "."
+            fp.write("\t".join([
+                species,
+                scaffold or ".",
+                "." if size is None else str(size),
+                str(rec["blocks"]),
+                str(rec["aligned_bases"]),
+                fraction,
+            ]) + "\n")
 
 
 def writeBlockTable(out_path, block_tmp_paths, n_species_total, expected_species):
@@ -646,6 +810,8 @@ def writeDashboard(
     cmdline,
     generated_at,
     LOG,
+    scaffolds=None,
+    top_scaffolds=10,
 ):
     try:
         import matplotlib
@@ -668,10 +834,14 @@ def writeDashboard(
     parsimony_informative_sites = int(overall["parsimony_informative_sites"])
     all_gap_sites = int(overall["all_gap_sites"])
 
+    scaffolds = scaffolds or {}
+    rollup = speciesScaffoldRollup(scaffolds)
+
     rows = []
     for sp, rec in species.items():
         blocks_present = int(rec["blocks_present"])
         total_sp_cells = rec["gaps_total"] + rec["nongaps_total"]
+        n_scaf, scaf_bases = rollup[sp] if sp in rollup else (0, 0)
         rows.append(
             {
                 "species": sp,
@@ -679,6 +849,8 @@ def writeDashboard(
                 "gap_fraction_cells": (rec["gaps_total"] / total_sp_cells) if total_sp_cells else 0.0,
                 "duplicated_blocks": int(rec["duplicated_blocks"]),
                 "blocks_present": blocks_present,
+                "scaffolds_in_maf": n_scaf,
+                "scaffold_bases_in_maf": scaf_bases,
             }
         )
 
@@ -857,6 +1029,44 @@ def writeDashboard(
     )
 
     species_summary_html = "".join(f"<li>{html.escape(item)}</li>" for item in species_summary_items)
+
+    # Largest scaffolds per species: one collapsed <details> per species, so a
+    # 241-way MAF stays scannable. Each summary line states "showing N of M"
+    # up front -- a trailing "... and N more" is easy to miss (as found with
+    # the species list in `mafutils info`). The TSV is never capped.
+    top_scaffolds = max(1, int(top_scaffolds))
+    by_species = defaultdict(list)
+    for (sp, scaffold), rec in scaffolds.items():
+        by_species[sp].append((scaffold, rec))
+    scaffold_detail_parts = []
+    for sp in sorted(by_species):
+        items = sorted(
+            by_species[sp],
+            key=lambda kv: (-(kv[1]["src_size"] if kv[1]["src_size"] is not None else -1), kv[0]),
+        )
+        shown = items[:top_scaffolds]
+        body = "".join(
+            "<tr>"
+            f"<td>{html.escape(scaffold or '.')}</td>"
+            f"<td>{'.' if rec['src_size'] is None else format(rec['src_size'], ',')}</td>"
+            f"<td>{rec['blocks']:,}</td>"
+            f"<td>{rec['aligned_bases']:,}</td>"
+            f"<td>{(format(rec['aligned_bases'] / rec['src_size'], '.4f')) if rec['src_size'] else '.'}</td>"
+            "</tr>"
+            for scaffold, rec in shown
+        )
+        scaffold_detail_parts.append(
+            "<details>"
+            f"<summary><b>{html.escape(sp)}</b> &mdash; showing {len(shown):,} of {len(items):,} scaffolds"
+            f"{' (largest by length)' if len(items) > len(shown) else ''}</summary>"
+            "<div class=\"table-wrap\"><table><thead><tr>"
+            "<th>Scaffold</th><th>Length (src_size)</th><th>Blocks</th>"
+            "<th>Aligned bases</th><th>Aligned fraction</th>"
+            "</tr></thead><tbody>"
+            f"{body}"
+            "</tbody></table></div></details>"
+        )
+    scaffold_details_html = "\n".join(scaffold_detail_parts) or "<p>No scaffolds recorded.</p>"
     species_table_html = "\n".join(
         [
             (
@@ -867,6 +1077,8 @@ def writeDashboard(
                 f"<td>{r['presence_fraction']:.4f}</td>"
                 f"<td>{r['gap_fraction_cells']:.4f}</td>"
                 f"<td>{r['duplicated_blocks']:,}</td>"
+                f"<td>{r['scaffolds_in_maf']:,}</td>"
+                f"<td>{r['scaffold_bases_in_maf']:,}</td>"
                 "</tr>"
             )
             for r in species_table_rows
@@ -1089,6 +1301,21 @@ th {{
   position: sticky;
   top: 0;
 }}
+details {{
+  margin: 6px 0;
+  border: 1px solid #dfe6ee;
+  border-radius: 6px;
+  padding: 4px 10px;
+}}
+summary {{
+  cursor: pointer;
+  padding: 4px 0;
+}}
+.note {{
+  font-size: 12px;
+  color: #556270;
+  margin: 8px 0 4px;
+}}
 .table-wrap {{
   max-height: 320px;
   overflow: auto;
@@ -1154,6 +1381,8 @@ th {{
             <th>Presence fraction</th>
             <th>Gap fraction (cells)</th>
             <th>Duplicated blocks</th>
+            <th>Scaffolds in MAF</th>
+            <th>Scaffold bases in MAF</th>
           </tr>
         </thead>
         <tbody>
@@ -1161,6 +1390,18 @@ th {{
         </tbody>
       </table>
     </div>
+    <p class="note">Scaffold counts and bases cover only scaffolds <b>present in the
+    MAF</b> (at least one aligned sequence line), not the species' full assembly:
+    unaligned scaffolds never appear, so these are lower bounds on assembly size.
+    Each scaffold's length is its true full length (MAF <code>srcSize</code>).</p>
+  </div>
+  <div class="section" id="species-scaffolds">
+    <b>Largest scaffolds per species</b>
+    <p class="note">Scaffolds present in the MAF, largest first. Collapsed by
+    default; the full list for every species is in
+    <code>&lt;prefix&gt;.species_scaffolds.tsv</code>. Aligned fraction can exceed
+    1.0 where a region aligns into several blocks.</p>
+    {scaffold_details_html}
   </div>
   {plot_section_html}
   {block_section_html}
@@ -1216,8 +1457,9 @@ def run_stats(args, cmdline="mafutils stats"):
 
     LOG.info(f"mafutils stats called as: {cmdline}")
     LOG.info("-" * 40)
+    arg_width = max(len(arg) for arg in vars(args))
     for arg, value in vars(args).items():
-        LOG.info(f"{arg:22} : {value}")
+        LOG.info(f"{arg:{arg_width}} : {value}")
     LOG.info("-" * 40)
 
     if args.processes < 1:
@@ -1248,7 +1490,11 @@ def run_stats(args, cmdline="mafutils stats"):
         LOG.info(f"Loaded {len(expected_species)} expected species for exact missing-species reporting.")
 
     LOG.info(f"Reading index file: {index_file}")
-    COMMON.validateIndexHeader(COMMON.readIndexHeader(index_file), args.maf_file, maf_compression, LOG, strict=args.verify_hash)
+    index_header = COMMON.readIndexHeader(index_file)
+    COMMON.validateIndexHeader(index_header, args.maf_file, maf_compression, LOG, strict=args.verify_hash)
+
+    header_blocks = COMMON.headerBlockCount(index_header, LOG, progress=args.progress_interval > 0)
+    LOG.info(COMMON.progressStartupLine(args.progress_interval))
 
     effective_processes = args.processes
     effective_chunk_size = args.chunk_size
@@ -1276,66 +1522,90 @@ def run_stats(args, cmdline="mafutils stats"):
         tasks_done = 0
         # The index is streamed, never materialized -- see iterIndexEntries.
         chunk_iter = enumerate(chunker(iterIndexEntries(index_file, LOG), effective_chunk_size), start=1)
+        progress = COMMON.BlockProgress(LOG, header_blocks, interval=args.progress_interval)
 
-        if effective_processes > 1:
-            # Bound in-flight work and merge results as they arrive, so peak
-            # memory is one accumulator plus the queued chunks rather than
-            # every chunk and every chunk's result.
-            max_in_flight = effective_processes * 2
-            with ProcessPoolExecutor(max_workers=effective_processes) as executor:
-                in_flight = {}
-                for task_id, chunk in chunk_iter:
-                    future = executor.submit(
-                        workerTask,
-                        task_id,
-                        args.maf_file,
-                        maf_compression,
-                        chunk,
-                        write_block_rows,
-                        tmp_dir,
-                    )
-                    in_flight[future] = len(chunk)
-                    if len(in_flight) < max_in_flight:
-                        continue
-                    done, _pending = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
-                    for f in done:
-                        total_blocks_seen += in_flight.pop(f)
+        try:
+            if effective_processes > 1:
+                # Bound in-flight work and merge results as they arrive, so peak
+                # memory is one accumulator plus the queued chunks rather than
+                # every chunk and every chunk's result.
+                max_in_flight = effective_processes * 2
+                with ProcessPoolExecutor(max_workers=effective_processes) as executor:
+                    in_flight = {}
+                    for task_id, chunk in chunk_iter:
+                        future = executor.submit(
+                            workerTask,
+                            task_id,
+                            args.maf_file,
+                            maf_compression,
+                            chunk,
+                            write_block_rows,
+                            tmp_dir,
+                        )
+                        in_flight[future] = len(chunk)
+                        if len(in_flight) < max_in_flight:
+                            continue
+                        done, _pending = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
+                        for f in done:
+                            n_blocks = in_flight.pop(f)
+                            total_blocks_seen += n_blocks
+                            mergeStatsInto(acc, f.result())
+                            tasks_done += 1
+                            progress.update(n_blocks)
+                    for f in list(in_flight):
+                        n_blocks = in_flight.pop(f)
+                        total_blocks_seen += n_blocks
                         mergeStatsInto(acc, f.result())
                         tasks_done += 1
-                for f in list(in_flight):
-                    total_blocks_seen += in_flight.pop(f)
-                    mergeStatsInto(acc, f.result())
-        else:
-            # Skip ProcessPoolExecutor entirely at processes=1 -- pool
-            # creation carries a large, mostly-fixed memory cost regardless
-            # of worker count (confirmed via mafutils gc's equivalent
-            # parallel/sequential split -- see DEVELOPMENT.md), not worth
-            # paying for a single worker that does the exact same work
-            # in-process anyway. workerTask is a plain function with no
-            # pool-initializer dependency, so calling it directly here is
-            # equivalent to submitting it to a 1-worker pool.
-            #
-            # One handle is opened here and reused for every chunk: entries
-            # are in ascending file order, so all seeks stay forward. This is
-            # what preserves the cheap gz path now that the index arrives in
-            # many chunks instead of one -- reopening per chunk would restart
-            # gzip decompression from byte 0 each time.
-            with COMMON.openMaf(args.maf_file, maf_compression, "rb") as shared_fp:
-                for task_id, chunk in chunk_iter:
-                    total_blocks_seen += len(chunk)
-                    tasks_done += 1
-                    mergeStatsInto(
-                        acc,
-                        workerTask(
-                            task_id, args.maf_file, maf_compression, chunk,
-                            write_block_rows, tmp_dir, maf_fp=shared_fp,
-                        ),
-                    )
+                        progress.update(n_blocks)
+            else:
+                # Skip ProcessPoolExecutor entirely at processes=1 -- pool
+                # creation carries a large, mostly-fixed memory cost regardless
+                # of worker count (confirmed via mafutils gc's equivalent
+                # parallel/sequential split -- see DEVELOPMENT.md), not worth
+                # paying for a single worker that does the exact same work
+                # in-process anyway. workerTask is a plain function with no
+                # pool-initializer dependency, so calling it directly here is
+                # equivalent to submitting it to a 1-worker pool.
+                #
+                # One handle is opened here and reused for every chunk: entries
+                # are in ascending file order, so all seeks stay forward. This is
+                # what preserves the cheap gz path now that the index arrives in
+                # many chunks instead of one -- reopening per chunk would restart
+                # gzip decompression from byte 0 each time.
+                with COMMON.openMaf(args.maf_file, maf_compression, "rb") as shared_fp:
+                    for task_id, chunk in chunk_iter:
+                        total_blocks_seen += len(chunk)
+                        tasks_done += 1
+                        mergeStatsInto(
+                            acc,
+                            workerTask(
+                                task_id, args.maf_file, maf_compression, chunk,
+                                write_block_rows, tmp_dir, maf_fp=shared_fp,
+                            ),
+                        )
+                        progress.update(len(chunk))
+
+        except SrcSizeConflictError as exc:
+            # Raised by a worker (re-raised through future.result()) or by the
+            # merge. Reported like every other fatal condition here -- logged,
+            # so it also lands in the run's log file -- rather than as a traceback.
+            LOG.error(str(exc))
+            sys.exit(1)
 
         if not total_blocks_seen:
             LOG.error("No valid index entries found.")
             sys.exit(1)
         LOG.info(f"Processed {total_blocks_seen} indexed blocks in {tasks_done} tasks.")
+        if header_blocks is not None and total_blocks_seen != header_blocks:
+            # Same run of `mafutils index` writes both, so they only disagree
+            # if the index was truncated or edited (or rows were skipped as
+            # malformed, each already warned about above).
+            LOG.warning(
+                f"Processed {total_blocks_seen:,} blocks but the index header records "
+                f"{header_blocks:,}. The index rows and header disagree, so these statistics may "
+                f"not cover the whole MAF; rebuild the index with `mafutils index`."
+            )
 
         overall = acc["overall"]
         species = acc["species"]
@@ -1376,13 +1646,31 @@ def run_stats(args, cmdline="mafutils stats"):
 
         overall_file = out_prefix + ".overall.tsv"
         species_file = out_prefix + ".species.tsv"
+        species_scaffolds_file = out_prefix + ".species_scaffolds.tsv"
         block_file = out_prefix + ".block.tsv"
+        scaffolds = acc["scaffolds"]
 
         LOG.info(f"Writing overall stats: {overall_file}")
         writeOverall(overall_file, overall, species_total)
 
         LOG.info(f"Writing species stats: {species_file}")
-        writeSpecies(species_file, species, int(overall["total_blocks"]))
+        writeSpecies(species_file, species, int(overall["total_blocks"]), scaffolds)
+
+        LOG.info(
+            f"Writing per-species scaffolds: {species_scaffolds_file} "
+            f"({len(scaffolds):,} species/scaffold pairs present in the MAF)"
+        )
+        writeSpeciesScaffolds(species_scaffolds_file, scaffolds)
+
+        size_errors = int(overall["scaffold_size_parse_errors"])
+        if size_errors:
+            LOG.warning(
+                "%d s line(s) had a srcSize that did not parse as an integer. A scaffold with no "
+                "parseable srcSize on any line is reported without a size in %s; all other "
+                "statistics are unaffected.",
+                size_errors,
+                species_scaffolds_file,
+            )
 
         if args.html_dashboard:
             dashboard_file = out_prefix + ".dashboard.html"
@@ -1398,6 +1686,8 @@ def run_stats(args, cmdline="mafutils stats"):
                 cmdline,
                 generated_at,
                 LOG,
+                scaffolds=scaffolds,
+                top_scaffolds=args.dashboard_top_scaffolds,
             )
 
         if not args.no_block_table:
@@ -1423,8 +1713,10 @@ def stats_command(
     expected_species_file: Annotated[str, typer.Option("--expected-species-file", help="File with one species name per line for exact missing lists.")] = "",
     verify_hash: Annotated[bool, typer.Option("--verify-hash", help="Verify the index's stored content hash against the MAF file (reads the whole file).")] = False,
     log_level: Annotated[LogLevel, typer.Option("--log-level", help="Logging level (default: INFO)")] = LogLevel.INFO,
+    progress_interval: OPTIONS.ProgressIntervalOption = COMMON.PROGRESS_INTERVAL_SECONDS,
     html_dashboard: Annotated[bool, typer.Option("--html-dashboard", help="Write an HTML dashboard with summary metrics and species plots.")] = False,
     dashboard_top_species: Annotated[int, typer.Option("--dashboard-top-species", help="Number of species to show in each dashboard bar plot (default: 25).")] = 25,
+    dashboard_top_scaffolds: Annotated[int, typer.Option("--dashboard-top-scaffolds", help="Largest scaffolds listed per species in the dashboard (default: 10). The species_scaffolds.tsv table is never capped.")] = 10,
     dashboard_max_block_points: Annotated[int, typer.Option("--dashboard-max-block-points", help="Maximum block rows sampled for dashboard block plots (default: 50000).")] = 50000,
 ) -> None:
     args = SimpleNamespace(
@@ -1438,8 +1730,10 @@ def stats_command(
         expected_species_file=expected_species_file,
         verify_hash=verify_hash,
         log_level=log_level.value,
+        progress_interval=progress_interval,
         html_dashboard=html_dashboard,
         dashboard_top_species=dashboard_top_species,
+        dashboard_top_scaffolds=dashboard_top_scaffolds,
         dashboard_max_block_points=dashboard_max_block_points,
     )
     cmdline = "mafutils stats"

@@ -51,6 +51,118 @@ for user-facing installation/usage docs.
   index time costs 2.06x (0.79s -> 1.62s per 1.5GB), which would undo most of
   the v0.6.0 speedup. Verified end to end: 1.3s on the 42.7GB file, and the
   fallback's scanned values equal the header's exactly.
+- **Per-species source scaffolds live in `stats`, not `index` or `info`.**
+  Scaffold names and `srcSize` are only on non-reference `s` lines: parsing
+  them in `index` measured 2.06x slower indexing, and sampling them in `info`
+  saturates far too slowly (54 species/scaffold pairs after 1,000 blocks vs
+  1,587 after 200,000 and still climbing). `parseBlock` already splits every
+  `s` line, so `fields[5]` is free there; one `partition(".")` replaces
+  `speciesFromSrc` and gives an identical species. Keyed by **(species,
+  scaffold)**: `human.chr4` and `chimp.chr4` are different sequences.
+  Everything it reports covers scaffolds **present in the MAF**, not the
+  assembly -- see the README's scope section; keep that caveat (and the
+  `_in_maf` column names) wherever these numbers surface.
+- **Conflicting `srcSize` for one species.scaffold fails the run.**
+  `reconcileSrcSize` is applied at all three merge levels (lines within a
+  block, blocks within a chunk, chunks in `mergeStatsInto`) and raises
+  `SrcSizeConflictError`, which `run_stats` turns into `LOG.error` + exit 1
+  without a traceback. Picking one value would be a silent fallback, and
+  "first seen" would differ across `-p`/`--chunk-size`. A `None` size (did not
+  parse) never conflicts and is filled in by any line that does parse. Real
+  data has had zero conflicts (2,647 scaffolds / 500,000 blocks; 1,752 pairs
+  on the 1.5GB slice), so this is defensive.
+- **`tests/example.maf` had an inconsistent `srcSize` from its first commit**
+  -- `chimp.chr4` was 1000 in one block and 998 in another; nothing read
+  `srcSize` until the conflict check above. Fixed to 1000 in `example.maf`,
+  `example-tabs.maf` and `expected-maf/08-span-multiple-gaps.maf`, with the
+  `.gz`/`.bgz` copies and every index regenerated (only the last block's end
+  offset moved, +1 byte; `test_scaffold_mode.py`'s hand-written header went
+  776 -> 777). Lesson: the script that first "hand-derived" the expected
+  values assigned each line's size over the previous one, which hid the
+  conflict. When deriving expected values, collect every distinct value per
+  key, never overwrite.
+- **Progress lines (`COMMON.BlockProgress` / `ByteProgress`)** are logged at
+  most every `PROGRESS_INTERVAL_SECONDS` (60). `stats` and parallel `gc` call
+  them once per finished chunk in the main process, against the header's
+  `blocks=` total. `index` and sequential `gc` see every block, so they check
+  only every `PROGRESS_CHECK_BLOCKS` (10,000) blocks -- sequential `gc` on
+  `a` lines only, so `s` lines pay nothing -- and measure bytes via
+  `diskPosition()`, an `lseek` on the stream's file descriptor. That gives
+  on-disk (compressed, for gz/bgzip) bytes for every compression type, which
+  the stream's own offsets (decompressed for gz, virtual for bgzip) do not;
+  `_HashingRawIO` passes `fileno()` through for it. Measured old -> new, 3
+  interleaved runs: `index` on 1.5GB **4.96s -> 4.82s**, sequential `gc` on
+  300MB **9.67s -> 9.50s** -- no cost beyond noise -- with byte-identical
+  outputs.
+- **`fetch` progress uses shared memory, not messages** (`newProgressSlots`):
+  one `multiprocessing.RawArray` int64 per task (batch or scaffold), written
+  only by that task -- no lock, no contention at any worker count, nothing sent
+  between processes -- and summed by the main process when its
+  `wait(timeout=progress.dueIn())` wakes. Needed because block mode has ONE
+  batch per worker, so the stats-style "update as chunks finish" would say
+  nothing until the end. Worker cost: one ~45ns store per region (block mode)
+  or per 8 MB copied (scaffold mode, uncompressed/gzip); bgzip scaffold copies
+  run per line, so they only count finished scaffolds. Passing a `RawArray`
+  through the pool initializer was checked under Python 3.14's forkserver
+  start method. Measured on the full 42.7GB hamster MAF + 979,442-region BED,
+  `-p 8`, 3 interleaved runs each: committed **101.6s** (100.5-102.8, after
+  discarding one cold-cache 133.6s run) vs new **102.7s** (101.4-103.7) --
+  within run-to-run spread on a shared node whose load varied 11-30. The
+  computed cost, 979,442 x 45ns = 0.044s of CPU across 8 workers, is far below
+  what the benchmark can resolve. All 979,442 FASTAs byte-identical.
+- **`--progress-interval` is one shared option on each command, not a global
+  one** (`lib/options.py`, `ProgressIntervalOption`). A global typer option
+  has to come before the subcommand, so the natural `mafutils stats ...
+  --progress-interval 300` would fail, and it would be missing from each
+  command's `--help`. Defining the `Annotated` option once keeps the name,
+  default, help and validation identical in `index`/`stats`/`gc`/`fetch`.
+  - **Validation:** 60 (`PROGRESS_INTERVAL_SECONDS`) is the default and the
+    minimum; `0` is off; 1-59 and negatives are a usage error (exit 2), never
+    clamped. The minimum is enforced only at the CLI, so `run_*` and
+    `BlockProgress` accept any interval for tests.
+  - **Off means nothing runs:** `BlockProgress.enabled` is false, so
+    `update`/`updateTo` return before reading the clock and `dueIn()` is
+    `None`, making fetch's `wait()` the plain blocking wait. `index` and
+    sequential `gc` test a local `report_progress` before even the modulo.
+    `fetch` allocates no slots, so workers skip the store, and scaffold copies
+    get no callback.
+  - **Measured on the 1.5GB slice** (3 interleaved runs each), committed vs
+    default vs off, outputs byte-identical: `index` 5.10s / 4.85s / 4.85s;
+    sequential `gc` (300MB) 10.08s / 9.27s / 9.87s. All within noise.
+- **`maf_fetch_summary.tsv` is written in batch order.** It used to be written
+  in the main process as each batch finished, so row order followed worker
+  timing and changed from run to run (the six benchmark runs above had six
+  different unsorted md5s, identical sorted). Workers now write their rows to
+  a per-batch temp file and the parent concatenates them in batch-number order
+  -- the same approach the loci table already used -- so the file is the same
+  for any `-p` and in index (genomic) order. Side benefits: the rows are no
+  longer pickled back through the result pipe, and the worker no longer holds
+  them in a list. The summary file now appears at the end of the run.
+- **Block-mode BED pre-check (`checkBlockRegions`)** runs after the index-order
+  sort and basename assignment (`-b count` numbers in that order) and before
+  batching (`chunker` cannot take zero regions: `range()` with step 0). It
+  reports everything in one error and exits 1 before any output. It replaced
+  four separate failures:
+  - `-b id` logged an error per unnamed region, ran anyway, then crashed in a
+    worker with `KeyError('output_basename')`;
+  - `parseBed`'s "skip malformed line" passed `file=` to a logger, so the
+    first malformed line -- or a UCSC `track` line -- crashed with a
+    `TypeError`;
+  - inverted or empty intervals were accepted and reported only as "no
+    overlapping blocks";
+  - duplicate output names (the hamster BED has 27,485 repeated 4th-column
+    values such as `lod=53`) silently overwrote each other's files, which are
+    opened "w".
+  On 979,442 regions the check takes 0.2-0.7s and 27-50MB transient.
+  `--single-output` skips the name checks, since it writes no per-region files.
+- **Verified on real data** (1.5GB hamster slice, 258,186 blocks): all 1,752
+  species/scaffold rows -- `src_size`, `blocks`, `aligned_bases` -- equal an
+  independent awk tally exactly, and every pre-existing output (`block.tsv`,
+  `overall.tsv` apart from the added row, `species.tsv`'s original 13 columns)
+  is byte-identical to the previous release's. Cost, 3 interleaved runs each,
+  previous -> new: `-p 1` on a 300MB slice **42.20s -> 42.30s (+0.2%, within
+  run-to-run spread)**; `-p 8` on the 1.5GB slice **30.44s -> 31.29s
+  (+2.8%)**, measured while node load varied between 9 and 13.
 
 ## Compression / index internals
 
@@ -520,7 +632,11 @@ computed `overall.tsv`/`species.tsv` values against numbers hand-derived
 directly from `tests/example.maf`'s raw content (not just "doesn't crash"),
 including a regression guard that the sequential (`-p 1`, no
 `ProcessPoolExecutor`) and real multi-worker (`-p 2`+) paths produce
-identical output.
+identical output. `tests/test_species_scaffolds.py` does the same for
+`species_scaffolds.tsv` and the two `_in_maf` columns: hand-derived values,
+the sum(`aligned_bases`) == `nongaps_total` invariant, invariance to
+`-p`/`--chunk-size`, and the conflicting/unparseable `srcSize` paths (run on a
+modified copy of `example.maf` in `tmp_path`, never the committed fixture).
 
 `tests/test_real_data.py` runs `stats`/`gc`/`fetch` against
 `tests/real-excerpt.maf` -- 8 real, complete alignment blocks extracted
