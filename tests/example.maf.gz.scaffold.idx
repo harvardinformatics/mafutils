@@ -1,7 +1,7 @@
-# mafutils-index format=2 maf=example.maf.gz compression=gz size=285 mtime=1784217118.0 hash=md5:67c22c97e78236b47ffeaf023f7a047b
+# mafutils-index format=2 maf=example.maf.gz compression=gz size=281 mtime=1792526737.0 hash=md5:02ccf92d78b5dbcb6c80572b93bd4f9a blocks=10 scaffolds=5 ref_bases=59 aln_cols=61 seq_lines=20 max_seqs=2
 chr1	16	263
 chr2	263	338
 chr3	338	482
 chr4	482	628
 chrX	628	700
-chr4	700	776
+chr4	700	777

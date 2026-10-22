@@ -9,6 +9,7 @@ import hashlib
 import io
 import os
 import sys
+import time
 
 from mafutils.lib import bgzf
 
@@ -114,6 +115,11 @@ class _HashingRawIO(io.RawIOBase):
     def tell(self):
         return self._raw.tell()
 
+    def fileno(self):
+        # For diskPosition() progress reporting only; all reads still go
+        # through readinto() below, so nothing bypasses the hash.
+        return self._raw.fileno()
+
     def seek(self, offset, whence=0):
         # bgzf.BgzfReader issues "seeks" as part of purely sequential reading
         # (e.g. re-asserting the current position when loading each new
@@ -198,7 +204,8 @@ def computeFileHash(maf_file, algo="md5"):
 COPY_CHUNK_SIZE = 8 * 1024 * 1024
 
 
-def copyMafRangeToStream(handle, compression, offset_start, offset_end, out_stream, chunk_size=COPY_CHUNK_SIZE):
+def copyMafRangeToStream(handle, compression, offset_start, offset_end, out_stream, chunk_size=COPY_CHUNK_SIZE,
+                         on_progress=None):
     """
     Copies the byte range [offset_start, offset_end) from an open binary-mode
     MAF handle straight into out_stream, in bounded chunks. Returns the number
@@ -215,6 +222,11 @@ def copyMafRangeToStream(handle, compression, offset_start, offset_end, out_stre
     Memory here is O(chunk_size) regardless of range size, for every
     compression type -- including bgzip, whose line-by-line path must also
     write as it goes rather than accumulating lines to join at the end.
+
+    on_progress, if given, is called with the cumulative bytes written after
+    each chunk -- once per chunk_size bytes, so free at any range size. The
+    bgzip path never calls it: that loop runs once per LINE, and is kept free
+    of any per-line work.
     """
     handle.seek(offset_start)
     written = 0
@@ -239,6 +251,8 @@ def copyMafRangeToStream(handle, compression, offset_start, offset_end, out_stre
         out_stream.write(chunk)
         written += len(chunk)
         remaining -= len(chunk)
+        if on_progress is not None:
+            on_progress(written)
     return written
 
 
@@ -561,5 +575,170 @@ def iterMafBlocks(stream, binary=False):
 
     if block_lines:
         yield block_lines, block_start, pos if binary else stream.tell()
+
+#############################################################################
+
+# Seconds between progress lines: the default for --progress-interval, and also
+# its minimum (0 turns progress off; see lib/options.py). A plain periodic log
+# line rather than a redrawn progress bar: the log goes to a file (and to SLURM
+# output) as well as the screen, where a redrawn bar turns into garbage.
+PROGRESS_INTERVAL_SECONDS = 60
+
+# Loops that see every block (index, sequential gc) only check progress every
+# this many blocks: a clock read plus an lseek is cheap, but not next to a
+# per-block hot path run 233M times on a whole-genome MAF.
+PROGRESS_CHECK_BLOCKS = 10_000
+
+
+def humanBytes(n):
+    """
+    Decimal units, so "GB" means 10^9 bytes and the printed number matches the
+    `size=` field in the index header rather than being 7% smaller.
+    """
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return f"{n:.2f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1000
+
+
+def diskPosition(stream):
+    """
+    How far into the file on disk this process has read, for any stream from
+    openMaf() or openMafHashing(). An lseek on the shared file descriptor, so
+    for gz/bgzip it is COMPRESSED bytes -- comparable with the file size, which
+    the stream's own positions (decompressed offsets for gz, virtual offsets
+    for bgzip) are not. Runs ahead of parsing by at most one read buffer.
+    """
+    return os.lseek(stream.fileno(), 0, os.SEEK_CUR)
+
+
+def headerBlockCount(header, LOG, progress=True):
+    """
+    The block count recorded in an index header (indexes built by mafutils
+    >= 0.7), used as the progress total and for the end-of-run check against
+    the blocks actually processed -- or None. When progress is on, says why it
+    will lack a percentage, rather than leaving it to look broken.
+    """
+    if header and "blocks" in header:
+        try:
+            return int(header["blocks"])
+        except ValueError:
+            consequence = "; progress will be reported without a percentage or time estimate" if progress else ""
+            LOG.warning(f"Index header has a non-integer block count ({header['blocks']!r}){consequence}.")
+            return None
+    if progress:
+        LOG.info(
+            "Index header has no block count (built before mafutils 0.7), so progress will be "
+            "reported without a percentage or time estimate. Rebuild the index with "
+            "`mafutils index` to get them."
+        )
+    return None
+
+
+def progressStartupLine(interval):
+    """The one line each command logs at startup about --progress-interval."""
+    if interval > 0:
+        return f"Progress is logged every {interval}s."
+    return "Progress reporting is off (--progress-interval 0)."
+
+
+def formatDuration(seconds):
+    seconds = int(round(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+class BlockProgress:
+    """
+    Throttled "N / total blocks" log lines for a long block-processing loop.
+
+    update() is called from the main process as each chunk of blocks finishes,
+    so its cost is one clock read per chunk and workers are never touched. It
+    logs at most once per `interval` seconds.
+
+    `total` is the block count from the index header (indexes built by
+    mafutils >= 0.7), or None for an older index -- lines then report blocks
+    and rate without a percentage or time estimate. Blocks are a rough proxy
+    for time (their size varies across a genome), so the estimate is rough.
+
+    `unit` names what is counted ("regions" for fetch). A caller that waits on
+    worker futures passes dueIn() as the wait timeout, so it wakes exactly when
+    a line is due instead of polling.
+
+    interval=0 (--progress-interval 0) turns it off: update/updateTo return at
+    once without reading the clock, and dueIn() is None, so a wait() given it
+    blocks exactly as it did before progress existed. Callers with per-block
+    hot loops also test `enabled` themselves, to skip their own bookkeeping.
+    """
+
+    def __init__(self, LOG, total, interval=None, clock=time.monotonic, unit="blocks"):
+        self.LOG = LOG
+        self.total = total
+        self.unit = unit
+        # Read at construction, not bound at definition, so a test can lower
+        # the module constant to see real lines without waiting a minute.
+        self.interval = PROGRESS_INTERVAL_SECONDS if interval is None else interval
+        self.enabled = self.interval > 0
+        self.clock = clock
+        self.done = 0
+        self.start = clock()
+        self.last_logged = self.start
+
+    def update(self, n_blocks):
+        if self.enabled:
+            self.updateTo(self.done + n_blocks)
+
+    def updateTo(self, done):
+        if not self.enabled:
+            return
+        self.done = done
+        now = self.clock()
+        if now - self.last_logged >= self.interval:
+            self.last_logged = now
+            self.LOG.info(self.message(now))
+
+    def dueIn(self):
+        if not self.enabled:
+            return None
+        return max(0.0, self.last_logged + self.interval - self.clock())
+
+    def describe(self, done, total):
+        return f"{done:,} / {total:,} {self.unit}" if total else f"{done:,} {self.unit}"
+
+    def describeRate(self, rate):
+        return f"{rate:,.0f} {self.unit}/s"
+
+    def message(self, now):
+        elapsed = now - self.start
+        rate = self.done / elapsed if elapsed > 0 else 0.0
+        msg = f"Progress: {self.describe(self.done, self.total)}"
+        if self.total:
+            msg += f" ({100 * self.done / self.total:.1f}%)"
+        msg += f", {self.describeRate(rate)}, {formatDuration(elapsed)} elapsed"
+        if self.total and rate > 0 and self.done < self.total:
+            msg += f", ~{formatDuration((self.total - self.done) / rate)} left"
+        return msg
+
+
+class ByteProgress(BlockProgress):
+    """
+    BlockProgress measured in bytes of the file on disk, for a single
+    sequential pass over the MAF that has no block total to measure against
+    (`mafutils index` is what builds it; sequential `gc` doesn't read the
+    index). Fed with updateTo(diskPosition(stream)), so for gz/bgzip it is
+    compressed bytes against the compressed file size. Bytes track time more
+    evenly than blocks do, since parsing cost scales with bytes.
+    """
+
+    def describe(self, done, total):
+        return f"{humanBytes(done)} / {humanBytes(total)}" if total else humanBytes(done)
+
+    def describeRate(self, rate):
+        return f"{humanBytes(int(rate))}/s"
 
 #############################################################################

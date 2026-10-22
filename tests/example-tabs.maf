@@ -37,4 +37,4 @@ s	gorilla.chrX	99	4	-	800	AGTC
 
 a score=400
 s	human.chr4	30	5	+	1000	T--ACGT
-s	chimp.chr4	28	5	+	998	TGG-C-T
+s	chimp.chr4	28	5	+	1000	TGG-C-T

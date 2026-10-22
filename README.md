@@ -143,6 +143,21 @@ check for this every run, at two tiers:
 For a "check once, trust thereafter" workflow instead of passing
 `--verify-hash` on every invocation, use `mafutils validate` (see below).
 
+## Progress Reporting
+
+`index`, `stats`, `gc` and `fetch` log a progress line while they run, every
+60 seconds by default. Each takes `--progress-interval SECONDS` to change it:
+
+- `60` or more sets the interval;
+- `0` turns progress off entirely: no lines, and none of the bookkeeping
+  behind them runs;
+- anything from 1 to 59, or negative, is rejected with a usage error rather
+  than adjusted.
+
+The option belongs to each command, so it goes after the command name:
+`mafutils stats input.maf --progress-interval 300`. What the lines count
+(blocks, bytes, regions) differs by command; see each command below.
+
 ## Commands
 
 ### `mafutils index`
@@ -160,6 +175,18 @@ Arguments:
 | `MAF_FILE` | Input MAF file (`.maf`, `.maf.gz`, or bgzip-compressed `.maf`) |
 | `BLOCK_INDEX` | Output block index path (default: `<MAF_FILE>.block.idx`) |
 | `SCAFFOLD_INDEX` | Output scaffold index path (default: `<MAF_FILE>.scaffold.idx`) |
+
+Options:
+
+| Option | Description |
+|---|---|
+| `--progress-interval` | Seconds between progress lines (default and minimum 60); `0` turns progress off. See Progress Reporting above |
+
+Every 60 seconds by default it logs how far through the file it is, e.g. `Progress:
+12.30 GB / 42.70 GB (28.8%), 123.00 MB/s, 1m 40s elapsed, ~4m 07s left`.
+Progress is in bytes because the block count is what indexing produces. For
+gzip and bgzip input both numbers are compressed bytes, compared against the
+compressed file size. Messages go to the screen only; no log file is written.
 
 ### `mafutils info`
 
@@ -211,7 +238,8 @@ index, and collecting them during indexing would mean parsing every
 non-reference `s` line — measured at 2.06x slower indexing. Sampling the first
 1,000 blocks costs milliseconds instead. On a whole-genome MAF those blocks all
 sit at the start of the first scaffold, so a species absent from that region is
-missed. Use `mafutils stats` for an exhaustive per-species breakdown.
+missed. Use `mafutils stats` for an exhaustive per-species breakdown,
+including each species' source scaffolds and their lengths.
 
 **Column meanings.** `ref scaffolds` and `ref bases` are measured on the
 *reference* sequence. `seq lines` counts every `s` line including the
@@ -238,7 +266,7 @@ Options:
 | Option | Description |
 |---|---|
 | `--index`, `-i` | Index file, block-level or scaffold-level matching `--mode`. **Required** — if omitted, looked up at `<MAF_FILE>.block.idx` or `<MAF_FILE>.scaffold.idx` by default; errors if not found there. |
-| `--basename`, `-b` | Output basename strategy: `id`, `coords`, or `count` |
+| `--basename`, `-b` | Output basename strategy: `id` (the BED's 4th column; every region needs a unique one -- see *BED pre-check* below), `coords`, or `count` |
 | `--output`, `-o` | Output directory or output filename in single-output mode |
 | `--fasta`, `-f` | Write FASTA instead of MAF |
 | `--fasta-header`, `-fh` | FASTA header format: `species-coords-id`, `species-coords`, or `species-only`. The coords-bearing modes always include the source scaffold (`species.scaffold`); `species-only` is deliberately bare so headers match tree tip labels |
@@ -252,6 +280,41 @@ Options:
 | `--verbose` | Emit warning lines from each completed batch |
 | `--profile` | Log internal timing breakdowns |
 | `--verify-hash` | Verify the index's stored content hash against the MAF file (see Index Integrity above) |
+| `--progress-interval` | Seconds between progress lines (default and minimum 60); `0` turns progress off. See Progress Reporting above |
+
+**BED pre-check.** In block mode, before doing any work, `fetch` checks the
+whole BED and stops with a single error listing every problem it finds:
+
+- lines it cannot use: fewer than 3 columns, non-integer start or end, a
+  negative start, or end ≤ start (each reported with its line number);
+- with `-b id`, regions that have no name (4th column);
+- regions that would write the same output file, where the later one would
+  silently replace the earlier: names used more than once with `-b id`
+  (allowed on different scaffolds with `--scaffold-subdirs`), or the same
+  region listed twice with `-b coords`. `-b count` numbers every region, so it
+  never collides.
+
+Blank lines, `#` comments, and UCSC `track`/`browser` header lines are
+skipped. Scaffolds that are not in the MAF are not an error; they are reported
+as a warning at the end, as before. The check takes under a second on a
+979,442-region BED.
+
+**Progress.** `fetch` logs one progress line every 60 seconds by default
+(`--progress-interval`), combining all workers:
+
+- **Block mode** counts regions, e.g. `Progress: 412,000 / 979,442 regions
+  (42.1%), 1,850 regions/s, 3m 42s elapsed, ~5m 06s left`. Workers finish
+  their shares at different times (the "Completed batch N" lines show which),
+  so the combined rate drops near the end and the last estimates run low.
+- **Scaffold mode** counts bytes copied against the total size of the requested
+  scaffolds, and logs `Finished <scaffold> (k of M scaffolds)` as each one
+  completes. For bgzip input it counts finished scaffolds instead of bytes:
+  its copy loop runs once per line and is kept free of progress checks.
+
+Each worker records its count in its own slot of shared memory, and the main
+process reads them only when a line is due. No messages pass between processes
+and no worker ever waits on another, so this adds no measurable time at any
+scale.
 
 ### Reference-side columns in `maf_fetch_summary.tsv`
 
@@ -463,9 +526,97 @@ Options:
 | `--expected-species-file` | File with one species name per line |
 | `--verify-hash` | Verify the index's stored content hash against the MAF file (see Index Integrity above) |
 | `--log-level` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `--progress-interval` | Seconds between progress lines (default and minimum 60); `0` turns progress off. See Progress Reporting above |
 | `--html-dashboard` | Write an HTML summary dashboard |
 | `--dashboard-top-species` | Number of species shown in dashboard bar plots |
 | `--dashboard-max-block-points` | Maximum block rows sampled for dashboard plots |
+| `--dashboard-top-scaffolds` | Largest scaffolds listed per species in the dashboard (default 10). The TSV is never capped. |
+
+Outputs:
+
+| File | Contents |
+|---|---|
+| `<prefix>.overall.tsv` | One metric per line |
+| `<prefix>.species.tsv` | One row per species |
+| `<prefix>.species_scaffolds.tsv` | One row per (species, source scaffold) present in the MAF — see below |
+| `<prefix>.block.tsv` | One row per block (skip with `--no-block-table`) |
+| `<prefix>.dashboard.html` | Self-contained summary dashboard (with `--html-dashboard`) |
+
+**Progress.** While it runs, `stats` logs a progress line every 60 seconds by
+default (`--progress-interval`), e.g. `Progress: 1,215,000 / 8,094,203 blocks (15.0%), 2,850 blocks/s, 7m 06s
+elapsed, ~40m 13s left`. The total comes from the index header, so an index
+built before mafutils 0.7 gives counts and rate only (rebuild it to get the
+percentage). Block sizes vary across a genome, so the time estimate is rough.
+If the number of blocks processed differs from the header's count, `stats`
+warns that the index rows and header disagree and the results may not cover
+the whole MAF. `gc` reports progress the same way; `index` measures it in
+bytes instead (see `mafutils index`).
+
+### Per-species source scaffolds
+
+`stats` reads every `s` line of every block, so it also records which source
+scaffolds each species contributes and how long they are. Nothing else reports
+this for non-reference species: the index never parses non-reference lines, and
+`info` only samples species names.
+
+**Scope: scaffolds present in the MAF, not the whole assembly.** A scaffold
+appears only if at least one of its bases aligned to the reference. Unaligned
+scaffolds — unplaced contigs, sequence outside the aligned regions — never
+appear in the MAF, so `stats` cannot see them. Each row's length is exact (it is
+the MAF's `srcSize`, which the aligner takes from the assembly), but the *set*
+of scaffolds is limited to those in the MAF. The per-species totals therefore
+err in opposite directions depending on the comparison:
+
+| Compared with | Direction | Why |
+|---|---|---|
+| the true assembly size | **under**counts | unaligned scaffolds contribute nothing |
+| aligned bases (`nongaps_total`) | **over**counts | a barely-aligned 200 Mb scaffold contributes all 200 Mb |
+
+The gap to the true assembly cannot be measured from the MAF alone — it needs
+the assembly's own scaffold list. It is small for chromosome-level assemblies
+and can be large for fragmented ones. Do not read `scaffold_bases_in_maf` as an
+assembly-size estimate.
+
+`<prefix>.species_scaffolds.tsv`, sorted by species, then largest scaffold
+first:
+
+| Column | Meaning |
+|---|---|
+| `species` | Species (the part of the MAF `src` before the first `.`) |
+| `scaffold` | Source scaffold (the part after it); `.` if the `src` has no `.` |
+| `src_size` | Full length of that scaffold in that species' assembly (MAF `srcSize`); `.` if it did not parse as an integer |
+| `blocks` | Blocks in which this scaffold appears |
+| `aligned_bases` | Non-gap bases from this scaffold across all blocks |
+| `aligned_fraction` | `aligned_bases / src_size`. **Not capped at 1.0**: a region aligned into several blocks (duplicated or paralogous alignments) can push it past 1, and that is worth seeing |
+
+Rows are keyed by (species, scaffold), never by scaffold name alone —
+`human.chr4` and `chimp.chr4` are different sequences that happen to share a
+name.
+
+Two columns are appended to the **end** of `<prefix>.species.tsv`, so no
+existing column moves:
+
+| Column | Meaning |
+|---|---|
+| `scaffolds_in_maf` | Distinct source scaffolds of this species present in the MAF |
+| `scaffold_bases_in_maf` | Sum of those scaffolds' full lengths |
+
+Per species, the `aligned_bases` of its scaffolds sum exactly to its
+`nongaps_total`, and their `blocks` sum to at least its `blocks_present`
+(more when a block holds several copies of the species).
+
+The dashboard adds both columns to its species table and a collapsed section
+per species listing the largest scaffolds. Each section's summary line reads
+"showing N of M scaffolds", so a truncated list is visible before expanding it.
+
+**`srcSize` integrity.** If one species.scaffold reports two different
+`srcSize` values, the MAF is internally inconsistent and `stats` exits with an
+error naming the scaffold and both values — picking one would hide the problem.
+An `s` line whose `srcSize` is not an integer still counts toward every other
+statistic. Its scaffold takes its length from any other line of that scaffold
+that does parse, and is written with `src_size` `.` only if none does. The
+number of such lines is logged as a warning and written to `overall.tsv` as
+`scaffold_size_parse_errors`.
 
 ### `mafutils gc`
 
@@ -497,6 +648,7 @@ Options:
 | `--chunk-size` | Blocks per worker task in parallel mode |
 | `--verify-hash` | Verify the index's stored content hash against the MAF file (see Index Integrity above; only checked when an index is actually used) |
 | `--log-level` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `--progress-interval` | Seconds between progress lines (default and minimum 60); `0` turns progress off. See Progress Reporting above |
 
 **Sequential vs. parallel processing:** GC counting is cheap per base, so the
 bottleneck is I/O/decompression rather than CPU. There are two processing

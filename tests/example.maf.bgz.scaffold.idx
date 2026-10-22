@@ -1,7 +1,7 @@
-# mafutils-index format=2 maf=example.maf.bgz compression=bgzip size=338 mtime=1784217089.0 hash=md5:70287d44c797b159e4201d7c880bc404
-chr1	3080192	3080439
-chr2	3080439	3080514
-chr3	3080514	3080658
-chr4	3080658	3080804
-chrX	3080804	3080876
-chr4	3080876	22151168
+# mafutils-index format=2 maf=example.maf.bgz compression=bgzip size=305 mtime=1792526737.0 hash=md5:54d36240911e394249124a0800fb75dd blocks=10 scaffolds=5 ref_bases=59 aln_cols=61 seq_lines=20 max_seqs=2
+chr1	16	263
+chr2	263	338
+chr3	338	482
+chr4	482	628
+chrX	628	700
+chr4	700	19988480

@@ -70,6 +70,9 @@ import time
 import statistics
 import tempfile
 import traceback
+import shutil
+import ctypes
+import multiprocessing
 from enum import Enum
 from types import SimpleNamespace
 from typing import Annotated, Optional
@@ -80,6 +83,7 @@ import typer
 
 from mafutils.lib import common as COMMON
 from mafutils.lib import loginit as LOGINIT
+from mafutils.lib import options as OPTIONS
 
 #############################################################################
 
@@ -105,6 +109,9 @@ WORKER_VERBOSE = None
 WORKER_PROFILE = None
 WORKER_MAF_FP = None
 WORKER_BLOCK_CACHE = None
+# One shared int64 per task, written only by that task -- see newProgressSlots.
+WORKER_PROGRESS_SLOTS = None
+WORKER_SUMMARY_TMP_DIR = None
 
 #############################################################################
 
@@ -185,6 +192,8 @@ def initBatchWorker(
     index_file=None,
     scaffold_runs=None,
     loci_tmp_dir=None,
+    progress_slots=None,
+    summary_tmp_dir=None,
 ):
     global WORKER_HEADER
     global WORKER_MAF_FILE
@@ -204,6 +213,8 @@ def initBatchWorker(
     global WORKER_PROFILE
     global WORKER_MAF_FP
     global WORKER_BLOCK_CACHE
+    global WORKER_PROGRESS_SLOTS
+    global WORKER_SUMMARY_TMP_DIR
 
     WORKER_HEADER = header
     WORKER_MAF_FILE = maf_file
@@ -224,6 +235,8 @@ def initBatchWorker(
     WORKER_FASTA_DEDUPE = fasta_dedupe
     WORKER_VERBOSE = verbose
     WORKER_PROFILE = profile
+    WORKER_PROGRESS_SLOTS = progress_slots
+    WORKER_SUMMARY_TMP_DIR = summary_tmp_dir
 
     # For gzip input, prefetched_cache already holds every block needed across
     # all regions, decoded in strictly-ascending file order (see
@@ -236,6 +249,24 @@ def initBatchWorker(
     atexit.register(closeBatchWorker)
 
 #############################################################################
+
+def newProgressSlots(n_tasks):
+    """
+    Shared memory for worker progress: one int64 per task, which only that
+    task ever writes (a plain store, ~45ns) and the main process sums when a
+    progress line is due. One writer per slot means no lock and no contention
+    at any worker count, and nothing is ever sent between processes -- so the
+    cost per region is the store alone, independent of MAF size. A Manager
+    value or a queue would instead make every update a round trip to another
+    process.
+    """
+    return multiprocessing.RawArray(ctypes.c_int64, n_tasks)
+
+
+def initScaffoldWorker(progress_slots):
+    global WORKER_PROGRESS_SLOTS
+    WORKER_PROGRESS_SLOTS = progress_slots
+
 
 def closeBatchWorker():
     global WORKER_MAF_FP
@@ -454,30 +485,113 @@ def parseBed(bed_file, LOG, mode="block"):
         - basename (from column 4, if present; otherwise None)
 
     In "scaffold" mode: accepts 1+ columns; only uses first column (scaffold)
+
+    Returns (regions, problems). `problems` lists (line_number, description)
+    for block-mode lines that cannot be used -- malformed, or not a valid
+    interval -- for the caller's BED pre-check to report all at once. They
+    used to be "skipped with a warning", but that call passed file= to a
+    logger, so the first bad line crashed fetch with a TypeError instead;
+    and an inverted or empty interval was accepted and only ever showed up
+    as "no overlapping blocks". Blank lines, # comments and UCSC
+    track/browser header lines are skipped.
     """
     regions = []
+    problems = []
     with open(bed_file, "r") as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             fields = line.split()
+            if fields[0] in ("track", "browser"):
+                continue
             if mode == "scaffold":
                 scaffold = fields[0]
                 region = {"scaffold": scaffold, "start": 0, "end": 0, "id": fields[3] if len(fields) >= 4 else None}
                 regions.append(region)
-            else:
-                # block mode: require at least 3 columns (scaffold/start/end)
-                try:
-                    scaffold = fields[0]
-                    start = int(fields[1])
-                    end = int(fields[2])
-                    region = {"scaffold": scaffold, "start": start, "end": end, "id": fields[3] if len(fields) >= 4 else None}
-                    regions.append(region)
-                except (IndexError, ValueError):
-                    LOG.warning(f"Skipping malformed BED line: {line}", file=sys.stderr)
-                    continue
-    return regions
+                continue
+            if len(fields) < 3:
+                problems.append((line_number, "fewer than 3 columns"))
+                continue
+            try:
+                start = int(fields[1])
+                end = int(fields[2])
+            except ValueError:
+                problems.append((line_number, "start/end not integers"))
+                continue
+            if start < 0 or end <= start:
+                problems.append((line_number, f"invalid interval {fields[0]}:{start}-{end}"))
+                continue
+            regions.append({"scaffold": fields[0], "start": start, "end": end, "id": fields[3] if len(fields) >= 4 else None})
+    return regions, problems
+
+
+def _count(n, noun):
+    return f"{n:,} {noun}" if n == 1 else f"{n:,} {noun}s"
+
+
+def checkBlockRegions(regions, bed_problems, basename_mode, single_output, scaffold_subdirs):
+    """
+    The block-mode BED pre-check: every problem that would make a run crash
+    part-way or silently lose output, found before any work and reported
+    together. Returns one short message per kind of problem (empty if none),
+    each with a single example. Expects output_basename already assigned.
+
+    Collisions are what matter for output: two regions whose output files have
+    the same path means the later silently replaces the earlier (files are
+    opened "w"). With --scaffold-subdirs the scaffold is part of the path, so
+    the same name on different scaffolds is fine. Memory is one set entry per
+    region, freed on return.
+    """
+    messages = []
+    if bed_problems:
+        line_number, why = bed_problems[0]
+        messages.append(f"{_count(len(bed_problems), 'unusable line')}, e.g. line {line_number}: {why}")
+
+    if not regions:
+        messages.append("no usable regions")
+        return messages
+
+    if single_output:
+        return messages             # one combined output: no per-region names
+
+    if basename_mode == "id":
+        unnamed = [r for r in regions if not r.get("id")]
+        if len(unnamed) == len(regions):
+            messages.append("no region has a name (4th column), which -b id needs")
+        elif unnamed:
+            r = unnamed[0]
+            messages.append(
+                f"{len(unnamed):,} of {_count(len(regions), 'region')} have no name (4th column), which -b id "
+                f"needs, e.g. {r['scaffold']}:{r['start']}-{r['end']}"
+            )
+
+    seen = defaultdict(set)         # scaffold (or "" without subdirs) -> names
+    repeats = defaultdict(int)      # (scaffold or "", name) -> extra occurrences
+    for r in regions:
+        name = r.get("output_basename")
+        if name is None:            # unnamed under -b id: reported above
+            continue
+        scope = r["scaffold"] if scaffold_subdirs else ""
+        if name in seen[scope]:
+            repeats[(scope, name)] += 1
+        else:
+            seen[scope].add(name)
+    if repeats:
+        (_scope, name), extra = next(iter(repeats.items()))
+        verb = "is" if len(repeats) == 1 else "are"
+        if basename_mode == "id":
+            where = " on the same scaffold" if scaffold_subdirs else ""
+            messages.append(
+                f"{_count(len(repeats), 'name')} {verb} shared by several regions{where}, whose files would "
+                f"overwrite each other, e.g. {name} ({extra + 1:,} regions)"
+            )
+        else:   # coords: scaffold-start-end, so only identical regions collide
+            messages.append(
+                f"{_count(len(repeats), 'region')} {verb} listed more than once, so their files would overwrite "
+                f"each other, e.g. {'{}:{}-{}'.format(*name.rsplit('-', 2))} ({extra + 1:,} times)"
+            )
+    return messages
 
 #############################################################################
 
@@ -1552,7 +1666,20 @@ def fetchByBatch(
         BATCHLOG.error(f"Batch {batch_num}: Worker MAF handle is not initialized.")
         raise RuntimeError("Worker MAF handle is not initialized.")
 
-    batch_results = [None] * len(batch)
+    # Summary rows go to a per-batch file that the parent concatenates in batch
+    # order (same as the loci table below), so maf_fetch_summary.tsv no longer
+    # depends on which worker finishes first. Only --single-output, which has
+    # no summary rows to order, still returns them in memory.
+    batch_results = [None] * len(batch) if WORKER_SUMMARY_TMP_DIR is None else None
+    summary_path = None
+    summary_fp = None
+    if WORKER_SUMMARY_TMP_DIR is not None:
+        summary_path = os.path.join(WORKER_SUMMARY_TMP_DIR, f"summary.task{batch_num}.tsv")
+        summary_fp = open(summary_path, "w", encoding="utf-8")
+    # This batch's progress slot (see newProgressSlots), as locals so the
+    # per-region store is one plain write; None with --progress-interval 0.
+    progress_slots = WORKER_PROGRESS_SLOTS
+    progress_slot = batch_num - 1
     region_num = 0
     no_output_regions = 0
     written_regions = 0
@@ -1630,7 +1757,12 @@ def fetchByBatch(
                 # conservative) offsets are kept -- correct, just more rescanning.
                 resume_by_scaffold[scaffold] = scan_state["resume"]
 
-            batch_results[result_idx] = region_result
+            if summary_fp is not None:
+                summary_fp.write(region_result + "\n")
+            else:
+                batch_results[result_idx] = region_result
+            if progress_slots is not None:      # None: --progress-interval 0
+                progress_slots[progress_slot] = region_num
             if not WORKER_SINGLE_OUTPUT:
                 # Field 4 is ref.n.overlapping.blocks (see summary_headers). This
                 # used to read field 1, which is the region's START coordinate
@@ -1651,13 +1783,16 @@ def fetchByBatch(
         index_fp.close()
         if loci_fp is not None:
             loci_fp.close()
+        if summary_fp is not None:
+            summary_fp.close()
 
     if profile_state is not None:
         profile_state["time_batch_total"] = time.perf_counter() - batch_timer_start
 
     return {
         "results": batch_results,
-        "processed_regions": len(batch_results),
+        "summary_path": summary_path,
+        "processed_regions": len(batch),
         "zero_overlap_regions": no_output_regions,
         "no_output_regions": no_output_regions,
         "batch_num": batch_num,
@@ -1671,13 +1806,24 @@ def fetchByBatch(
 
 #############################################################################
 
-def fetchByScaffold(scaffold, start_end, maf_file, maf_header, maf_compression, out_dir, LOG, scaffold_subdirs=False):
+def fetchByScaffold(scaffold, start_end, maf_file, maf_header, maf_compression, out_dir, LOG, scaffold_subdirs=False,
+                    progress_slot=None):
     """
     Worker function to extract one scaffold from the MAF file.
     start_end is a tuple (start_byte, end_byte).
+
+    progress_slot: this task's index into WORKER_PROGRESS_SLOTS, which gets
+    the bytes copied so far after every 8 MB chunk (see newProgressSlots).
     """
     start, end = start_end
     output_path = buildOutputPath(out_dir, scaffold, scaffold, ".maf", scaffold_subdirs)
+
+    on_progress = None
+    if progress_slot is not None:
+        slots = WORKER_PROGRESS_SLOTS
+
+        def on_progress(written):
+            slots[progress_slot] = written
 
     try:
         with COMMON.openMaf(maf_file, maf_compression, "rb") as mfp, open(output_path, "wb") as outfp:
@@ -1685,7 +1831,7 @@ def fetchByScaffold(scaffold, start_end, maf_file, maf_header, maf_compression, 
             outfp.write(maf_header.encode("utf-8"))
             # Streamed in bounded chunks: a scaffold can be hundreds of GB,
             # far too large to materialize as one bytes object.
-            written = COMMON.copyMafRangeToStream(mfp, maf_compression, start, end, outfp)
+            written = COMMON.copyMafRangeToStream(mfp, maf_compression, start, end, outfp, on_progress=on_progress)
     except Exception as e:
         # repr(), plus the traceback, because some of the exceptions that
         # actually occur here have an empty str() -- MemoryError being the
@@ -1697,29 +1843,40 @@ def fetchByScaffold(scaffold, start_end, maf_file, maf_header, maf_compression, 
     return {"scaffold": scaffold, "output_path": output_path, "ok": True, "bytes_written": written}
 
 
-def fetchScaffoldsSequential(ordered_scaffolds, index, maf_file, maf_header, maf_compression, out_dir, LOG, scaffold_subdirs=False):
+def fetchScaffoldsSequential(ordered_scaffolds, index, maf_file, maf_header, maf_compression, out_dir, LOG, scaffold_subdirs=False,
+                             progress=None):
     """
     Extracts multiple scaffolds using a single open MAF handle, in the given
     (ascending file-offset) order. Used for gzip input: reusing one handle
     and never seeking backward avoids the redundant-decompression cost that
     reopening the file per scaffold (as fetchByScaffold does) would incur.
+
+    Runs in the main process, so `progress` (a ByteProgress over the summed
+    scaffold spans) is fed directly, once per 8 MB chunk.
     """
     results = []
+    copied_before = 0       # bytes from scaffolds already finished
     with COMMON.openMaf(maf_file, maf_compression, "rb") as mfp:
-        for scaffold in ordered_scaffolds:
+        for n_done, scaffold in enumerate(ordered_scaffolds, start=1):
             start, end = index[scaffold]
             output_path = buildOutputPath(out_dir, scaffold, scaffold, ".maf", scaffold_subdirs)
+            on_progress = None
+            if progress is not None:
+                def on_progress(written, base=copied_before):
+                    progress.updateTo(base + written)
             try:
                 LOG.info(f">>> Scaffold {scaffold}");
                 with open(output_path, "wb") as outfp:
                     outfp.write(maf_header.encode("utf-8"))
                     # Streamed in bounded chunks -- see fetchByScaffold.
-                    written = COMMON.copyMafRangeToStream(mfp, maf_compression, start, end, outfp)
+                    written = COMMON.copyMafRangeToStream(mfp, maf_compression, start, end, outfp, on_progress=on_progress)
             except Exception as e:
                 LOG.error(f"{scaffold}: FAILED to extract: {e!r}")
                 LOG.debug("Traceback for %s:\n%s", scaffold, traceback.format_exc())
                 results.append({"scaffold": scaffold, "output_path": output_path, "ok": False, "error": repr(e)})
                 continue
+            copied_before += written
+            LOG.info(f"Finished {scaffold} ({n_done} of {len(ordered_scaffolds)} scaffolds)")
             results.append({"scaffold": scaffold, "output_path": output_path, "ok": True, "bytes_written": written})
     return results
 
@@ -1742,11 +1899,12 @@ def run_fetch(args, cmdline="mafutils fetch"):
 
     LOG.info(f"mafutils fetch called as: {cmdline}");
     LOG.info("-" * 40);
+    arg_width = max(len(arg) for arg in vars(args))
     for arg, value in vars(args).items():
         valstr = str(value)
         if len(valstr) > 80:
             valstr = valstr[:77] + "..."
-        LOG.info(f"{arg:20} : {valstr}")
+        LOG.info(f"{arg:{arg_width}} : {valstr}")
     LOG.info("-" * 40 )
     # Log the command line arguments
 
@@ -1848,7 +2006,7 @@ def run_fetch(args, cmdline="mafutils fetch"):
         )
 
     LOG.info(f"Parsing BED file...... {args.bed_file}");
-    regions = parseBed(args.bed_file, LOG, args.mode);
+    regions, bed_problems = parseBed(args.bed_file, LOG, args.mode);
 
     expected_species = parseExpectedSpecies(args)
     if expected_species:
@@ -1895,6 +2053,26 @@ def run_fetch(args, cmdline="mafutils fetch"):
         # Process scaffolds in ascending file-offset order; for gzip this is
         # what lets a single reused handle avoid ever seeking backward.
         ordered_scaffolds = sorted(scaffold_set, key=lambda s: index[s][0])
+        n_scaffolds = len(ordered_scaffolds)
+
+        # Progress in bytes copied, against the summed scaffold spans -- exact
+        # for uncompressed (file bytes) and gzip (decompressed offsets). bgzip
+        # offsets are virtual and its copy loop runs per LINE, which is kept
+        # free of checks, so bgzip counts finished scaffolds instead.
+        # With --progress-interval 0 there are no slots and no copy callback.
+        progress_on = args.progress_interval > 0
+        byte_progress = progress_on and maf_compression != "bgzip"
+        LOG.info(COMMON.progressStartupLine(args.progress_interval))
+        if byte_progress:
+            progress = COMMON.ByteProgress(LOG, sum(index[s][1] - index[s][0] for s in ordered_scaffolds),
+                                           interval=args.progress_interval)
+        else:
+            if progress_on:
+                LOG.info(
+                    "bgzip input: progress counts finished scaffolds, not bytes (its copy loop runs "
+                    "once per line and is kept free of progress checks)."
+                )
+            progress = COMMON.BlockProgress(LOG, n_scaffolds, interval=args.progress_interval, unit="scaffolds")
 
         scaffold_results = []
         if maf_compression == "gz":
@@ -1904,14 +2082,21 @@ def run_fetch(args, cmdline="mafutils fetch"):
                     "gzip-compressed files; --processes will be ignored. (Use a bgzip-compressed MAF "
                     "for real parallel speedup on compressed input.)"
                 )
-            scaffold_results = fetchScaffoldsSequential(ordered_scaffolds, index, args.maf_file, maf_header, maf_compression, args.output, LOG, scaffold_subdirs=args.scaffold_subdirs)
+            scaffold_results = fetchScaffoldsSequential(ordered_scaffolds, index, args.maf_file, maf_header, maf_compression, args.output, LOG, scaffold_subdirs=args.scaffold_subdirs, progress=progress if byte_progress else None)
         else:
-            # Extract from MAF using the region index for matching scaffolds
-            with ProcessPoolExecutor(max_workers=args.processes) as executor:
-                futures = []
-                for scaffold in ordered_scaffolds:
+            # Extract from MAF using the region index for matching scaffolds.
+            # Scaffold i writes its bytes-copied count to slot i (see
+            # newProgressSlots); results are stored by slot so the reporting
+            # below sees them in the original order, whatever order they finish.
+            progress_slots = newProgressSlots(n_scaffolds) if byte_progress else None
+            results_by_slot = [None] * n_scaffolds
+            n_finished = 0
+            with ProcessPoolExecutor(max_workers=args.processes, initializer=initScaffoldWorker,
+                                     initargs=(progress_slots,)) as executor:
+                futures = {}
+                for slot, scaffold in enumerate(ordered_scaffolds):
                     start, end = index[scaffold]
-                    futures.append(executor.submit(
+                    futures[executor.submit(
                         fetchByScaffold,
                         scaffold,
                         (start, end),
@@ -1921,9 +2106,20 @@ def run_fetch(args, cmdline="mafutils fetch"):
                         args.output,
                         LOG,
                         args.scaffold_subdirs,
-                    ))
-                for future in futures:
-                    scaffold_results.append(future.result())
+                        slot if byte_progress else None,
+                    )] = slot
+                while futures:
+                    # Times out exactly when a progress line is due.
+                    done, _pending = wait(list(futures.keys()), timeout=progress.dueIn(), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        slot = futures.pop(future)
+                        result = future.result()
+                        results_by_slot[slot] = result
+                        n_finished += 1
+                        status = "Finished" if result["ok"] else "FAILED"
+                        LOG.info(f"{status} {result['scaffold']} ({n_finished} of {n_scaffolds} scaffolds)")
+                    progress.updateTo(sum(progress_slots) if byte_progress else n_finished)
+            scaffold_results = results_by_slot
 
         # Only report "Wrote" for extractions that actually produced data --
         # never for one that raised or came back empty.
@@ -1998,6 +2194,37 @@ def run_fetch(args, cmdline="mafutils fetch"):
     unknown_rank = len(scaffold_first_run)
     regions.sort(key=lambda r: (scaffold_first_run.get(r["scaffold"], unknown_rank), r["start"], r["end"]))
 
+    # Pre-assign output basenames for regions -- after the sort, because
+    # -b count numbers regions per scaffold in this (index) order.
+    region_counter = {}
+    for region in regions:
+        scaffold = region["scaffold"]
+        start = region["start"]
+        end = region["end"]
+        basename_mode = args.basename
+
+        if basename_mode == "id":
+            # None when the BED has no name; the pre-check below reports that.
+            region["output_basename"] = region["id"]
+        elif basename_mode == "count":
+            count = region_counter.get(scaffold, 0) + 1
+            region_counter[scaffold] = count
+            region["output_basename"] = f"{scaffold}.{count}"
+        else: # basename_mode == "coords":
+            region["output_basename"] = f"{scaffold}-{start}-{end}"
+
+    # BED pre-check: everything that would crash the run part-way or silently
+    # lose output, reported in ONE error before any work (and before batching,
+    # which cannot handle zero regions). See checkBlockRegions.
+    bed_check = checkBlockRegions(regions, bed_problems, args.basename, args.single_output, args.scaffold_subdirs)
+    if len(bed_check) == 1:
+        LOG.error(f"BED check failed for {args.bed_file}: {bed_check[0]}. Nothing was fetched.")
+        sys.exit(1)
+    if bed_check:
+        LOG.error(f"BED check failed for {args.bed_file}; nothing was fetched:\n  - " + "\n  - ".join(bed_check))
+        sys.exit(1)
+    LOG.info(f"BED check passed: {_count(len(regions), 'region')}.")
+
     num_regions = len(regions);
     # One batch per worker: each streams its own span of the index. Splitting
     # by region count (not by scaffold) keeps parallelism independent of how
@@ -2021,27 +2248,6 @@ def run_fetch(args, cmdline="mafutils fetch"):
             output_file = args.output
         LOG.info(f"Using single output file: {output_file}")
     ## Single output mode being developed !
-
-    # Pre-assign output basenames for regions.
-    # For regions missing a 4th column (basename), assign a unique counter per scaffold.
-    region_counter = {}
-    for region in regions:
-        scaffold = region["scaffold"]
-        start = region["start"]
-        end = region["end"]
-        basename_mode = args.basename
-
-        if basename_mode == "id":
-            if region.get("id"):
-                region["output_basename"] = region["id"]
-            else:
-                LOG.error(f"Basename mode set to 'id', but '{region}' lacks an ID (4th column).");
-        elif basename_mode == "count":
-            count = region_counter.get(scaffold, 0) + 1
-            region_counter[scaffold] = count
-            region["output_basename"] = f"{scaffold}.{count}"
-        else: # basename_mode == "coords":
-            region["output_basename"] = f"{scaffold}-{start}-{end}"
 
     if args.scaffold_subdirs:
         # Pre-create every needed scaffold subdirectory upfront, in the main
@@ -2070,6 +2276,24 @@ def run_fetch(args, cmdline="mafutils fetch"):
     loci_tmp = tempfile.TemporaryDirectory(prefix="maf_fetch_loci_", dir=args.output) if args.loci_table else None
     loci_tmp_dir = loci_tmp.name if loci_tmp is not None else None
     loci_paths = {}
+    # Workers write summary rows per batch; concatenated in batch order below.
+    summary_tmp = None if args.single_output else tempfile.TemporaryDirectory(prefix="maf_fetch_summary_", dir=args.output)
+    summary_tmp_dir = summary_tmp.name if summary_tmp is not None else None
+    summary_paths = {}
+    # ref.* prefix marks the columns measured on the REFERENCE, so they are
+    # not mistaken for per-species facts: the reference is contiguous by
+    # construction while a species can jump kilobases at the same boundary
+    # (that asymmetry is what the n.*/split.* columns exist to report).
+    # ref.block.bases was "block.lengths", whose plural implied a list when
+    # it is a single sum; it falls below (end - start) exactly when the
+    # region has reference bases no block covers.
+    summary_headers = ["scaffold", "start", "end", "basename", "ref.n.overlapping.blocks", "ref.block.bases", "n.sequences"] + ELEMENT_LOCI_HEADERS
+    # Batch b writes its regions-done count to slot b-1 (see newProgressSlots);
+    # the wait() below wakes when a line is due and sums them.
+    # With --progress-interval 0 there are no slots, so workers skip the store.
+    progress = COMMON.BlockProgress(LOG, num_regions, interval=args.progress_interval, unit="regions")
+    LOG.info(COMMON.progressStartupLine(args.progress_interval))
+    progress_slots = newProgressSlots(len(batches)) if progress.enabled else None
     with ProcessPoolExecutor(
         max_workers=effective_processes,
         initializer=initBatchWorker,
@@ -2091,18 +2315,10 @@ def run_fetch(args, cmdline="mafutils fetch"):
             index_file,
             scaffold_runs,
             loci_tmp_dir,
+            progress_slots,
+            summary_tmp_dir,
         ),
-    ) as executor, open(info_outfile, "w") as info_out:
-        # ref.* prefix marks the columns measured on the REFERENCE, so they are
-        # not mistaken for per-species facts: the reference is contiguous by
-        # construction while a species can jump kilobases at the same boundary
-        # (that asymmetry is what the n.*/split.* columns exist to report).
-        # ref.block.bases was "block.lengths", whose plural implied a list when
-        # it is a single sum; it falls below (end - start) exactly when the
-        # region has reference bases no block covers.
-        summary_headers = ["scaffold", "start", "end", "basename", "ref.n.overlapping.blocks", "ref.block.bases", "n.sequences"] + ELEMENT_LOCI_HEADERS
-        info_out.write("\t".join(summary_headers) + "\n")
-
+    ) as executor:
         futures = {}
         for batch_num, batch in enumerate(batches, start=1):
             future = executor.submit(
@@ -2113,7 +2329,11 @@ def run_fetch(args, cmdline="mafutils fetch"):
             futures[future] = batch_num
 
         while futures:
-            done, _pending = wait(list(futures.keys()), return_when=FIRST_COMPLETED)
+            # Times out exactly when a progress line is due, so the main
+            # process sleeps between lines instead of polling.
+            done, _pending = wait(list(futures.keys()), timeout=progress.dueIn(), return_when=FIRST_COMPLETED)
+            if progress_slots is not None:
+                progress.updateTo(sum(progress_slots))
             for future in done:
                 batch_num = futures.pop(future)
                 result = future.result()
@@ -2126,8 +2346,7 @@ def run_fetch(args, cmdline="mafutils fetch"):
                     loci_paths[result["batch_num"]] = result["loci_path"]
 
                 if not args.single_output:
-                    for r in result["results"]:
-                        info_out.write(r + "\n")
+                    summary_paths[result["batch_num"]] = result["summary_path"]
                     total_regions_reported += result["processed_regions"]
                     zero_overlap_regions += result["zero_overlap_regions"]
                     missing_scaffold_regions += result["warning_counts"].get("missing-scaffold", 0)
@@ -2183,6 +2402,18 @@ def run_fetch(args, cmdline="mafutils fetch"):
     if fail_fast_triggered:
         LOG.error(fail_fast_message)
         sys.exit(2)
+
+    # In BATCH-NUMBER order, not completion order: batches partition the
+    # index-ordered regions, so the table is deterministic and in genomic order.
+    # It used to be written as batches finished, so its row order changed from
+    # run to run with worker timing. Same approach as the loci table below.
+    with open(info_outfile, "w", encoding="utf-8") as info_out:
+        info_out.write("\t".join(summary_headers) + "\n")
+        for batch_num in sorted(summary_paths):
+            with open(summary_paths[batch_num], "r", encoding="utf-8") as fp:
+                shutil.copyfileobj(fp, info_out)
+    if summary_tmp is not None:
+        summary_tmp.cleanup()
 
     if args.profile and profile_totals is not None and profiled_batches > 0:
         LOG.info("Profile summary across %d batch(es):", profiled_batches)
@@ -2299,7 +2530,7 @@ def fetch_command(
             help="Index file (block-level or scaffold-level, matching --mode). Required -- if omitted, looked up at <MAF_FILE>.block.idx or <MAF_FILE>.scaffold.idx by default; errors if not found there.",
         ),
     ] = None,
-    basename: Annotated[BasenameMode, typer.Option("--basename", "-b", help="Basename strategy: 'id' (BED 4th col if present), 'coords' (scaffold-start-end), or 'count' (numbered per scaffold)")] = BasenameMode.coords,
+    basename: Annotated[BasenameMode, typer.Option("--basename", "-b", help="Basename strategy: 'id' (BED 4th column; every region must have one), 'coords' (scaffold-start-end), or 'count' (numbered per scaffold)")] = BasenameMode.coords,
     output: Annotated[str, typer.Option("--output", "-o", help="Output directory (default: current directory); if --single-output is used, this should instead be a filename and will default to maf-fetch.maf in the current directory.")] = ".",
     fasta: Annotated[bool, typer.Option("--fasta", "-f", help="Output region(s) in FASTA format instead of MAF.")] = False,
     fasta_header: Annotated[FastaHeaderMode, typer.Option("--fasta-header", "-fh", help="Controls the FASTA header format: 'species-coords-id' (default, includes species, coordinates, and region ID if present),'species-coords' (species and coordinates only), or 'species-only' (just the species name).")] = FastaHeaderMode.species_coords,
@@ -2314,6 +2545,7 @@ def fetch_command(
     verbose: Annotated[bool, typer.Option("--verbose", help="Print every warning line after each batch completes.")] = False,
     profile: Annotated[bool, typer.Option("--profile", help="Log aggregate timing breakdowns for internal fetch steps.")] = False,
     verify_hash: Annotated[bool, typer.Option("--verify-hash", help="Verify the index's stored content hash against the MAF file (reads the whole file).")] = False,
+    progress_interval: OPTIONS.ProgressIntervalOption = COMMON.PROGRESS_INTERVAL_SECONDS,
 ) -> None:
     args = SimpleNamespace(
         maf_file=maf_file,
@@ -2334,6 +2566,7 @@ def fetch_command(
         verbose=verbose,
         profile=profile,
         verify_hash=verify_hash,
+        progress_interval=progress_interval,
     )
     cmdline = "mafutils fetch"
     if len(sys.argv) > 2:

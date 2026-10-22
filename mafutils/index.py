@@ -6,6 +6,7 @@
 #############################################################################
 
 import hashlib
+import logging
 import os
 import shutil
 import tempfile
@@ -14,6 +15,8 @@ from typing import Annotated, Optional
 import typer
 
 from mafutils.lib import common as COMMON
+from mafutils.lib import loginit as LOGINIT
+from mafutils.lib import options as OPTIONS
 
 
 def process_maf_block(block):
@@ -35,11 +38,19 @@ def process_maf_block(block):
     return row, int(ref_seq[3]), seq_len, num_seqs
 
 
-def run_index(maf_file, block_index_path, scaffold_index_path):
+def run_index(maf_file, block_index_path, scaffold_index_path, LOG, progress_interval=COMMON.PROGRESS_INTERVAL_SECONDS):
     maf_compression = COMMON.detectCompression(maf_file)
     size = os.path.getsize(maf_file)
     mtime = os.path.getmtime(maf_file)
     hash_obj = hashlib.md5()
+
+    LOG.info(
+        f"Indexing {maf_file} ({COMMON.humanBytes(size)}, {maf_compression}). "
+        f"{COMMON.progressStartupLine(progress_interval)}"
+    )
+    # Bytes, not blocks: the block total is what this run is building.
+    progress = COMMON.ByteProgress(LOG, size, interval=progress_interval)
+    report_progress = progress.enabled      # a local: tested once per block
 
     out_dir = os.path.dirname(block_index_path) or "."
     with tempfile.TemporaryDirectory(prefix="maf_index_tmp_", dir=out_dir) as tmp_dir:
@@ -76,6 +87,11 @@ def run_index(maf_file, block_index_path, scaffold_index_path):
                 ref_scaffold = block_info[0]
 
                 n_blocks += 1
+                # Hot path: only every PROGRESS_CHECK_BLOCKS blocks does this
+                # cost more than one modulo (a clock read and an lseek), and
+                # with --progress-interval 0 not even the modulo runs.
+                if report_progress and n_blocks % COMMON.PROGRESS_CHECK_BLOCKS == 0:
+                    progress.updateTo(COMMON.diskPosition(maf_stream))
                 total_ref_bases += ref_len
                 total_aln_cols += aln_cols
                 total_seq_lines += num_seqs
@@ -124,14 +140,27 @@ def run_index(maf_file, block_index_path, scaffold_index_path):
             with open(scaffold_tmp_path, "r") as tmp_fp:
                 shutil.copyfileobj(tmp_fp, scaffold_stream)
 
+    LOG.info(
+        f"Indexed {n_blocks:,} blocks on {len(distinct_scaffolds):,} reference scaffold(s): "
+        f"{block_index_path}, {scaffold_index_path}"
+    )
+
 
 def index_command(
     maf_file: Annotated[str, typer.Argument(help="Input MAF file (.maf, .maf.gz, or bgzip-compressed .maf)")],
     block_index: Annotated[Optional[str], typer.Argument(help="Output block index path (default: <MAF_FILE>.block.idx)")] = None,
     scaffold_index: Annotated[Optional[str], typer.Argument(help="Output scaffold index path (default: <MAF_FILE>.scaffold.idx)")] = None,
+    progress_interval: OPTIONS.ProgressIntervalOption = COMMON.PROGRESS_INTERVAL_SECONDS,
 ) -> None:
     if block_index is None:
         block_index = COMMON.deriveBlockIndexPath(maf_file)
     if scaffold_index is None:
         scaffold_index = COMMON.deriveScaffoldIndexPath(maf_file)
-    run_index(maf_file, block_index, scaffold_index)
+    # Screen only, like validate: a log file next to the indexes would be a
+    # new, unasked-for output.
+    logger_name = LOGINIT.configureLogging(
+        log_level="INFO",
+        log_verbosity="SCREEN",
+        logger_name="maf_index_logger",
+    )
+    run_index(maf_file, block_index, scaffold_index, logging.getLogger(logger_name), progress_interval=progress_interval)

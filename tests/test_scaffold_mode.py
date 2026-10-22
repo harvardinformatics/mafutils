@@ -13,7 +13,7 @@ REPO_ROOT = os.path.abspath(os.path.join(TEST_DIR, ".."))
 MAF_FILE = os.path.join(TEST_DIR, "example.maf")
 SCAFFOLD_INDEX = os.path.join(TEST_DIR, "example.maf.scaffold.idx")
 
-HEADER = "# mafutils-index format=2 maf=t.maf compression=none size=776 mtime=1.0 hash=md5:x\n"
+HEADER = "# mafutils-index format=2 maf=t.maf compression=none size=777 mtime=1.0 hash=md5:x\n"
 
 
 def run_fetch(args):
