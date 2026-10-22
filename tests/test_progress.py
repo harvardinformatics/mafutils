@@ -2,6 +2,7 @@ import hashlib
 import io
 import logging
 import os
+import re
 import subprocess
 import sys
 
@@ -333,6 +334,20 @@ def _mafutils(args):
                           check=False, cwd=REPO_ROOT, capture_output=True, text=True)
 
 
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(text):
+    """
+    typer's own help and error output, as plain text. It is coloured whenever
+    rich thinks it is on a terminal -- including on GitHub Actions, where
+    `--progress-interval` arrives as "-", "-progress", "-interval" with escape
+    codes between them -- and errors are drawn in a box and wrapped. Strip the
+    codes and the box, and join the lines.
+    """
+    return " ".join(ANSI_ESCAPE.sub("", text).replace("\u2502", " ").split())
+
+
 COMMANDS = ["index", "stats", "gc", "fetch"]
 
 
@@ -355,22 +370,21 @@ def test_progress_interval_below_minimum_is_a_usage_error(command, value, tmp_pa
     """Rejected, never clamped: a silently changed value would hide the mistake."""
     r = _mafutils([command] + _command_args(command, tmp_path) + ["--progress-interval", value])
     assert r.returncode == 2
-    # typer draws the error in a box and wraps it; compare with the box and
-    # line breaks collapsed
-    flat = " ".join((r.stdout + r.stderr).replace("\u2502", " ").split())
+    flat = _plain(r.stdout + r.stderr)
     assert f"must be 0 (off) or at least 60 seconds, not {value}." in flat, flat
 
 
 @pytest.mark.parametrize("command", COMMANDS)
 def test_progress_interval_is_in_help(command):
     r = _mafutils([command, "--help"])
-    assert r.returncode == 0 and "--progress-interval" in r.stdout
+    assert r.returncode == 0 and "--progress-interval" in _plain(r.stdout)
 
 
 @pytest.mark.parametrize("command", ["info", "validate"])
 def test_commands_without_progress_do_not_take_the_option(command):
     r = _mafutils([command, "--help"])
-    assert r.returncode == 0 and "--progress-interval" not in r.stdout
+    # plain text matters here too: in colour, "not in" would pass vacuously
+    assert r.returncode == 0 and "--progress-interval" not in _plain(r.stdout)
 
 
 @pytest.mark.parametrize("mode_args", [
