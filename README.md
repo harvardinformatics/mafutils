@@ -143,21 +143,6 @@ check for this every run, at two tiers:
 For a "check once, trust thereafter" workflow instead of passing
 `--verify-hash` on every invocation, use `mafutils validate` (see below).
 
-## Progress Reporting
-
-`index`, `stats`, `gc` and `fetch` log a progress line while they run, every
-60 seconds by default. Each takes `--progress-interval SECONDS` to change it:
-
-- `60` or more sets the interval;
-- `0` turns progress off entirely: no lines, and none of the bookkeeping
-  behind them runs;
-- anything from 1 to 59, or negative, is rejected with a usage error rather
-  than adjusted.
-
-The option belongs to each command, so it goes after the command name:
-`mafutils stats input.maf --progress-interval 300`. What the lines count
-(blocks, bytes, regions) differs by command; see each command below.
-
 ## Commands
 
 ### `mafutils index`
@@ -180,13 +165,7 @@ Options:
 
 | Option | Description |
 |---|---|
-| `--progress-interval` | Seconds between progress lines (default and minimum 60); `0` turns progress off. See Progress Reporting above |
-
-Every 60 seconds by default it logs how far through the file it is, e.g. `Progress:
-12.30 GB / 42.70 GB (28.8%), 123.00 MB/s, 1m 40s elapsed, ~4m 07s left`.
-Progress is in bytes because the block count is what indexing produces. For
-gzip and bgzip input both numbers are compressed bytes, compared against the
-compressed file size. Messages go to the screen only; no log file is written.
+| `--progress-interval` | Seconds between progress lines (default and minimum 60); `0` turns them off |
 
 ### `mafutils info`
 
@@ -266,7 +245,7 @@ Options:
 | Option | Description |
 |---|---|
 | `--index`, `-i` | Index file, block-level or scaffold-level matching `--mode`. **Required** — if omitted, looked up at `<MAF_FILE>.block.idx` or `<MAF_FILE>.scaffold.idx` by default; errors if not found there. |
-| `--basename`, `-b` | Output basename strategy: `id` (the BED's 4th column; every region needs a unique one -- see *BED pre-check* below), `coords`, or `count` |
+| `--basename`, `-b` | Output basename strategy: `id` (the BED's 4th column, which must be present and unique), `coords`, or `count` |
 | `--output`, `-o` | Output directory or output filename in single-output mode |
 | `--fasta`, `-f` | Write FASTA instead of MAF |
 | `--fasta-header`, `-fh` | FASTA header format: `species-coords-id`, `species-coords`, or `species-only`. The coords-bearing modes always include the source scaffold (`species.scaffold`); `species-only` is deliberately bare so headers match tree tip labels |
@@ -276,186 +255,74 @@ Options:
 | `--processes`, `-p` | Number of worker processes (see Compression above — plain gzip always runs single-process) |
 | `--mode`, `-m` | Fetch mode: `block` or `scaffold` |
 | `--scaffold-subdirs` | Group output files into subfolders named by reference scaffold (`<output>/<scaffold>/<basename>`) instead of one flat directory |
-| `--loci-table` | Also write `<output>/maf_fetch_loci.tsv`: one row per region/species/contributing-block with each species' source scaffold, coordinates, `srcSize`, and a locus classification (see *Per-species coordinates* below). Requires `--fasta` |
+| `--loci-table` | Also write `<output>/maf_fetch_loci.tsv` (see below). Requires `--fasta` |
 | `--verbose` | Emit warning lines from each completed batch |
 | `--profile` | Log internal timing breakdowns |
 | `--verify-hash` | Verify the index's stored content hash against the MAF file (see Index Integrity above) |
-| `--progress-interval` | Seconds between progress lines (default and minimum 60); `0` turns progress off. See Progress Reporting above |
+| `--progress-interval` | Seconds between progress lines (default and minimum 60); `0` turns them off |
 
-**BED pre-check.** In block mode, before doing any work, `fetch` checks the
-whole BED and stops with a single error listing every problem it finds:
+**BED pre-check.** In block mode, `fetch` checks the whole BED before doing
+any work and stops with one error listing every problem: unusable lines
+(malformed, or end ≤ start), regions without a name under `-b id`, and regions
+that would overwrite each other's output file (a repeated name under `-b id`,
+or a repeated region under `-b coords`). `#` comments and `track`/`browser`
+lines are skipped.
 
-- lines it cannot use: fewer than 3 columns, non-integer start or end, a
-  negative start, or end ≤ start (each reported with its line number);
-- with `-b id`, regions that have no name (4th column);
-- regions that would write the same output file, where the later one would
-  silently replace the earlier: names used more than once with `-b id`
-  (allowed on different scaffolds with `--scaffold-subdirs`), or the same
-  region listed twice with `-b coords`. `-b count` numbers every region, so it
-  never collides.
+**Outputs:**
 
-Blank lines, `#` comments, and UCSC `track`/`browser` header lines are
-skipped. Scaffolds that are not in the MAF are not an error; they are reported
-as a warning at the end, as before. The check takes under a second on a
-979,442-region BED.
+- One file per region (`.maf`, or `.fa` with `--fasta`), named by `--basename`,
+  in `--output` (or in per-scaffold subfolders with `--scaffold-subdirs`).
+  Scaffold mode writes one `<scaffold>.maf` per scaffold instead.
+- `maf_fetch_summary.tsv`: one row per BED region, in genomic order.
+- `maf_fetch_loci.tsv` (with `--loci-table`): one row per region, species and
+  contributing block.
 
-**Progress.** `fetch` logs one progress line every 60 seconds by default
-(`--progress-interval`), combining all workers:
+Both tables describe how each species' sequence for a region is put together.
+A region's alignment blocks are contiguous in the reference, but a species'
+pieces of those blocks ("chunks") need not be contiguous in its own genome, so
+each species is given a class:
 
-- **Block mode** counts regions, e.g. `Progress: 412,000 / 979,442 regions
-  (42.1%), 1,850 regions/s, 3m 42s elapsed, ~5m 06s left`. Workers finish
-  their shares at different times (the "Completed batch N" lines show which),
-  so the combined rate drops near the end and the last estimates run low.
-- **Scaffold mode** counts bytes copied against the total size of the requested
-  scaffolds, and logs `Finished <scaffold> (k of M scaffolds)` as each one
-  completes. For bgzip input it counts finished scaffolds instead of bytes:
-  its copy loop runs once per line and is kept free of progress checks.
+| class | meaning |
+|---|---|
+| `single` | one chunk |
+| `contiguous` | several chunks, adjacent in the species' own sequence |
+| `split` | chunks separated by sequence the aligner did not align |
+| `multi_strand` | chunks on both strands |
+| `multi_scaffold` | chunks from more than one source scaffold |
+| `no_bases` | present in the alignment, but all gaps in this region |
 
-Each worker records its count in its own slot of shared memory, and the main
-process reads them only when a line is due. No messages pass between processes
-and no worker ever waits on another, so this adds no measurable time at any
-scale.
+Only `single` and `contiguous` are one locus: for those, the FASTA header's
+span equals the bases written. For the others it never does; the span is a
+bounding box over chunks that are separated, on both strands, or on different
+scaffolds.
 
-### Reference-side columns in `maf_fetch_summary.tsv`
+For background on these classes, filtering recipes, and an example of building
+a per-species BED, see [docs/fetch-outputs.md](docs/fetch-outputs.md).
 
-Three of the original columns describe the **reference**, not any species, and
-the `ref.` prefix marks them as such:
+### `maf_fetch_summary.tsv`
 
 | column | meaning |
 |---|---|
-| `ref.n.overlapping.blocks` | how many alignment blocks the region overlaps |
-| `ref.block.bases` | reference bases in the region that alignment blocks cover |
+| `scaffold`, `start`, `end`, `basename` | the BED region and its output file name |
+| `ref.n.overlapping.blocks` | alignment blocks the region overlaps |
+| `ref.block.bases` | reference bases in the region covered by blocks; less than `end - start` when part of the region is unaligned (logged as a `ref-coverage-gap` warning) |
+| `n.sequences` | sequences in the region's FASTA file, including `--expected-species` filled with Ns; `NA` for MAF output |
+| `n.species` | species contributing to the region |
+| `n.single`, `n.contiguous`, `n.split`, `n.multi.strand`, `n.multi.scaffold`, `n.no.bases` | species in each class |
+| `split.bases.max` | the most unaligned bases in any one split species |
+| `split.gap.median` | median of every individual gap between chunks |
+| `split.boundaries` | block boundaries where at least one species splits |
+| `split.max.boundary.n.species` | the most species splitting at a single boundary |
+| `split.max.boundary.gap.spread` | `max - min` of those species' gaps at that boundary |
 
-`ref.block.bases` normally equals `end - start`. It falls short exactly when
-the region contains reference positions no block covers, and in that case
-`fetch` emits a `ref-coverage-gap` warning naming the distances involved.
+The `ref.` columns describe the reference only. They say nothing about whether
+a species' sequence is contiguous; the `n.*` and `split.*` columns do.
 
-This distinction matters: **the reference is contiguous by construction, so
-these columns say nothing about whether a species' sequence is contiguous.** A
-species can jump kilobases at a boundary where the reference does not. The old
-`interblock.distances` column was removed for exactly this reason — it
-reported reference-side gaps, which are all zeros on a normal MAF (measured:
-19,999/19,999 consecutive block pairs adjacent), and reading it as a
-contiguity check was misleading. Per-species contiguity lives in the `n.*` /
-`split.*` columns below and in the loci table's `gap_to_next`.
-
-### Per-element locus classification (always written)
-
-`maf_fetch_summary.tsv` carries one row per BED element and reports how each
-species' contribution to that element looks. These columns are always written
-(no flag needed) and work with MAF or FASTA output:
-
-| column | meaning |
-|---|---|
-| `n.species` | species contributing to this element |
-| `n.single`, `n.contiguous` | species whose contribution **is** one locus — for these, the header span equals the bases emitted |
-| `n.split` | species interrupted by sequence the aligner declined to align |
-| `n.multi.scaffold`, `n.multi.strand` | species stitched from different source sequences or strands |
-| `n.no.bases` | species present in the alignment but contributing zero bases to this element (an all-gap row) |
-| `split.bases.max` | worst species' total unaligned bases, i.e. how much sequence its row is missing |
-| `split.gap.median` | median of every individual gap in the element |
-| `split.boundaries` | distinct block boundaries with any split |
-| `split.max.boundary.n.species` | most species splitting at a single boundary |
-| `split.max.boundary.gap.spread` | `max - min` of those species' gaps at that same boundary |
-
-Both extent columns matter: one real element had a median gap of 63 bp across
-13 split species but one species off by 335 Mb. The max alone would condemn an
-element where 12 species are nearly fine; the median alone would wave through a
-catastrophic misalignment.
-
-The concentration columns answer *"is one shared event responsible?"*. Splits
-occur at block boundaries, which are single reference positions, so species
-jumping at the same boundary are interrupted at the same place. Compare
-`split.max.boundary.n.species` to `n.split`: equal, with a small
-`gap.spread`, means one ancestral indel (a real case had six species at
-33/34/33/33/33/33 — spread 1); much lower means independent lineage-specific
-events. Where nearly every species jumps at one boundary, the most
-parsimonious reading is a reference-specific deletion, which makes the
-element's own reference definition the questionable thing.
-
-**Filter at the granularity your product actually needs** — these are very
-different yields, and using the strict one for a single-species product
-throws away most of your data.
-
-These examples look columns up by **name**, so they keep working if the
-schema changes:
-
-*All species* — "safe to claim a locus in every species", e.g. for a
-concatenated alignment you want uniformly clean:
-
-```bash
-awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)c[$i]=i; print; next}
-  $c["n.split"]==0 && $c["n.multi.scaffold"]==0 &&
-  $c["n.multi.strand"]==0 && $c["n.no.bases"]==0' maf_fetch_summary.tsv
-```
-
-*One species* — for a per-species product such as a BED in a single
-non-reference genome, filter that species' own rows in the loci table
-instead; an element unusable for one species is usually fine for the rest.
-
-Two things to get right when aggregating those rows:
-
-1. **The table is one row per contributing block**, so a `contiguous` species
-   with two chunks yields two rows for one element. Since `contiguous` means
-   the chunks are adjacent by definition, merging them (min start, max end)
-   is lossless and gives one interval per element. On one real dataset a
-   species had 1,703 clean chunk rows across 1,462 elements — counting rows
-   would overstate the element count by 16%.
-2. **Skip `chunk_size == 0` rows.** They are emitted so nothing is hidden, but
-   they contribute no sequence and are excluded from `class` — so a `single`
-   record can still have a zero-size row, *possibly on a different scaffold*.
-   Aggregating without filtering them produced a nonsense 5.9 Mb interval in
-   testing.
-
-A complete per-species BED, merged and converted to forward-strand
-coordinates (verified: 1,462 intervals, median width 109 bp against a
-reference element median of 129 bp):
-
-```bash
-awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)c[$i]=i; next}
-  $c["species"]=="YOUR_SPECIES" && $c["chunk_size"]+0>0 &&
-  ($c["class"]=="single" || $c["class"]=="contiguous") {
-    k=$c["region_scaffold"]":"$c["region_start"]
-    s=$c["chunk_start"]+0; e=s+$c["chunk_size"]
-    if(!(k in lo) || s<lo[k]) lo[k]=s
-    if(!(k in hi) || e>hi[k]) hi[k]=e
-    scaf[k]=$c["src_scaffold"]; str[k]=$c["chunk_strand"]
-    sz[k]=$c["src_size"]+0; id[k]=$c["region_id"]
-  }
-  END{ for(k in lo){
-      if(str[k]=="-"){ a=sz[k]-hi[k]; b=sz[k]-lo[k] } else { a=lo[k]; b=hi[k] }
-      print scaf[k]"\t"a"\t"b"\t"id[k]"\t0\t"str[k]
-  }}' maf_fetch_loci.tsv > species.bed
-```
-
-The `str[k]=="-"` branch is the forward-strand conversion described above —
-`src_size - end` .. `src_size - start`, since mafutils reports MAF-frame
-coordinates and leaves the choice of frame to you.
-
-On one real 15-species dataset the all-species filter kept **65.8%** of
-elements while the per-species filter kept **82-86%** (mean 83.7%) depending
-on the species; on a more fragmented 45-way alignment the per-species figure
-was reported at **98.6%**. The gap is dataset-specific, so measure yours
-rather than assuming either number.
-
-### Per-species coordinates (`--loci-table`)
-
-FASTA headers name the source scaffold, but for a **non-reference** species a
-header's `start-end` is a *bounding box* over every block that contributed, not
-necessarily one locus. MAF blocks are contiguous in the reference only: a
-species' chunks can be separated, inverted, or on different scaffolds, and
-stitching concatenates them without padding. On real data (2,000 regions, 15
-species) 88.5% of region/species pairs are unambiguously one locus, but ~11%
-are split and ~0.8% span more than one scaffold.
-
-`--loci-table` writes the per-chunk truth so you can filter before treating a
-row as a locus:
+### `maf_fetch_loci.tsv` (`--loci-table`)
 
 ```bash
 mafutils fetch input.maf regions.bed -f -fh species-coords-id --loci-table -o out/
 ```
-
-`out/maf_fetch_loci.tsv` has one row per (region, species, contributing block):
 
 | column | meaning |
 |---|---|
@@ -463,41 +330,16 @@ mafutils fetch input.maf regions.bed -f -fh species-coords-id --loci-table -o ou
 | `species`, `src_scaffold`, `src_size` | that species' source sequence for this chunk |
 | `chunk_start`, `chunk_size`, `chunk_strand` | the chunk, exactly as the MAF states it |
 | `chunk_index`, `n_chunks` | position among that species' chunks for this region |
-| `block_index` | which block (ordinal within the element) this chunk came from |
+| `block_index` | which block (ordinal within the region) this chunk came from |
 | `gap_to_next` | signed gap to that species' next chunk; `.` for the last |
-| `class` | `single`, `contiguous`, `split`, `multi_strand`, `multi_scaffold`, or `no_bases` |
+| `class` | the species' class for this region (table above); the same on all its rows |
 | `max_gap` | largest signed gap between consecutive chunks; `0` for single/contiguous, `.` where undefined |
 
-`class` is constant within a (region, species) group, so filtering is a one-liner:
-
-```bash
-awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)c[$i]=i; next}
-  $c["class"]=="single" || $c["class"]=="contiguous"' out/maf_fetch_loci.tsv
-```
-
-**Coordinates are reported exactly as the MAF states them.** For `strand = -`
-that means they count in the reverse-complemented source, which is MAF's own
-convention. `src_size` is included so forward-genomic coordinates are one
-subtraction away — `src_size - (chunk_start + chunk_size)` to
-`src_size - chunk_start` — rather than mafutils choosing a frame for you. No
-gap threshold is applied either. A `split` gap is **not** an indel the
-alignment absorbed: the aligner threads query insertions inline as
-reference-row gap columns only up to ~37 bp, and breaks the block past that, so
-a gap between chunks is query sequence the aligner *declined to align* — real
-bases absent from the FASTA while the header's span still covers them. The
-consequence holds with no exceptions: `single`/`contiguous` records have
-`header span == emitted bases`, `split`/`multi_*` never do. Real gaps range
-from a median of 45 bp to 335 Mb, so `max_gap` is reported and the judgment is
-yours.
-
-The table is roughly (regions x species) rows, so it is off by default — a
-979k-region BED at 15 species produces ~13.7M rows.
-
-On plain-gzip input, `fetch` precomputes the set of blocks needed across
-*all* regions, decodes each exactly once in strictly-ascending file order,
-then serves every region from that cache — this avoids the backward seeks
-that would otherwise come from processing regions in arbitrary (e.g. BED
-file) order, and decodes shared blocks only once even when regions overlap.
+Coordinates are exactly as in the MAF, so on the `-` strand they count from the
+end of the source sequence. `src_size` is included so forward coordinates are
+one subtraction away: `src_size - (chunk_start + chunk_size)` to
+`src_size - chunk_start`. The table has roughly (regions × species) rows, so it
+is off by default.
 
 ### `mafutils stats`
 
@@ -526,7 +368,7 @@ Options:
 | `--expected-species-file` | File with one species name per line |
 | `--verify-hash` | Verify the index's stored content hash against the MAF file (see Index Integrity above) |
 | `--log-level` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `--progress-interval` | Seconds between progress lines (default and minimum 60); `0` turns progress off. See Progress Reporting above |
+| `--progress-interval` | Seconds between progress lines (default and minimum 60); `0` turns them off |
 | `--html-dashboard` | Write an HTML summary dashboard |
 | `--dashboard-top-species` | Number of species shown in dashboard bar plots |
 | `--dashboard-max-block-points` | Maximum block rows sampled for dashboard plots |
@@ -541,16 +383,6 @@ Outputs:
 | `<prefix>.species_scaffolds.tsv` | One row per (species, source scaffold) present in the MAF — see below |
 | `<prefix>.block.tsv` | One row per block (skip with `--no-block-table`) |
 | `<prefix>.dashboard.html` | Self-contained summary dashboard (with `--html-dashboard`) |
-
-**Progress.** While it runs, `stats` logs a progress line every 60 seconds by
-default (`--progress-interval`), e.g. `Progress: 1,215,000 / 8,094,203 blocks (15.0%), 2,850 blocks/s, 7m 06s
-elapsed, ~40m 13s left`. The total comes from the index header, so an index
-built before mafutils 0.7 gives counts and rate only (rebuild it to get the
-percentage). Block sizes vary across a genome, so the time estimate is rough.
-If the number of blocks processed differs from the header's count, `stats`
-warns that the index rows and header disagree and the results may not cover
-the whole MAF. `gc` reports progress the same way; `index` measures it in
-bytes instead (see `mafutils index`).
 
 ### Per-species source scaffolds
 
@@ -648,7 +480,7 @@ Options:
 | `--chunk-size` | Blocks per worker task in parallel mode |
 | `--verify-hash` | Verify the index's stored content hash against the MAF file (see Index Integrity above; only checked when an index is actually used) |
 | `--log-level` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `--progress-interval` | Seconds between progress lines (default and minimum 60); `0` turns progress off. See Progress Reporting above |
+| `--progress-interval` | Seconds between progress lines (default and minimum 60); `0` turns them off |
 
 **Sequential vs. parallel processing:** GC counting is cheap per base, so the
 bottleneck is I/O/decompression rather than CPU. There are two processing
