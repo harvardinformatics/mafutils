@@ -702,6 +702,55 @@ for user-facing installation/usage docs.
   backward-seek risk entirely rather than relying on any per-region
   processing order.
 
+## Possible future work
+
+- **Duplicate checks in `stats`** (assessed 2026-11, not implemented).
+  "Duplicates" reported in `cactus-hal2maf --outType single` ("nodupes") MAFs
+  are expected, not a Cactus bug. That option guarantees at most one row per
+  genome per block, not that each non-reference base appears only once: where
+  the reference has several copies of a region, a single-copy segment of
+  another genome aligns at each of them. On a 27-genome hamster MAF this was
+  2.2-3.7% of each non-reference genome's aligned bases, and 0 for the
+  reference.
+  - *A genome in more than one row of a block* is already counted per
+    species (`duplicated_blocks` in `species.tsv`, `n_duplicate_copies` in
+    `block.tsv`). Still missing, and cheap:
+    - an overall count of affected blocks (summing the species counts
+      double-counts);
+    - the first few locations;
+    - a log line worded for both nodupes and full MAFs.
+  - *Duplicate bases per genome* = aligned bases minus distinct bases, using
+    forward-strand coordinates (`srcSize - start - size` for `-` rows) and
+    keyed by (genome, sequence); optionally a BED of the duplicated intervals.
+    It needs every row's interval:
+    - merge intervals within each worker chunk (keeps ~36% of rows on a
+      hamster slice), counting overlaps within the chunk before merging;
+    - write compact binary records to one temporary file per genome;
+    - sort each genome in memory.
+
+    Estimated at about 6 bytes of temporary disk per MAF row (~0.6 GB for the
+    42.7 GB hamster MAF), so it should be opt-in. Check a large MAF's row
+    count first (`seq lines` in `mafutils info`). Deferred mainly over that
+    temporary-disk cost on very large MAFs.
+- **`fetch` copies `i`/`e`/`q` lines through trimmed blocks unchanged**
+  (`trimMafBlock`, the `fields[0] != "s"` branch). In a block trimmed to a
+  region, a `q` line keeps its full-width quality string while its `s` line is
+  cut, so the two lengths no longer match. `i`-line base counts also go stale
+  at trimmed edges. `e` lines stay valid, and FASTA output never reads these
+  lines. Only MAFs that have them are affected: UCSC multiz MAFs, not cactus
+  ones. A fix would trim `q` lines with their `s` line and drop or recompute
+  `i` lines in trimmed blocks only, checked for byte-identity on whole blocks.
+- **`e`-line status could tell an indel from missing data.** `e` marks a
+  species with no aligned bases in a block but bridged across it. Its status
+  says why:
+  - C: the flanking sequence is contiguous, so the region was deleted in that
+    species or inserted in the reference;
+  - I: unaligned bases in between;
+  - M: those bases are mostly N, i.e. missing data.
+
+  `fetch` and `stats` treat all of these, and "not aligned at all", as the same
+  absence. This applies to UCSC MAFs only.
+
 ## Development setup
 
 From a source checkout, an editable install picks up code changes without
