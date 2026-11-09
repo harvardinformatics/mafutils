@@ -155,6 +155,53 @@ for user-facing installation/usage docs.
     opened "w".
   On 979,442 regions the check takes 0.2-0.7s and 27-50MB transient.
   `--single-output` skips the name checks, since it writes no per-region files.
+- **The per-element locus summary no longer grows with region size**
+  (`ElementLociAccumulator`).
+  - **The problem:** from v0.6.0, `fetchByRegion` kept one chunk dict per `s`
+    line of the region (`element_chunks`) just to compute the 12 summary
+    columns at the end. That is ~450 B per line, so a 69 Mb region of a
+    45-way bird MAF (40.5M `s` lines) was OOM-killed at 6 GB, where v0.5.0
+    used 307 MB.
+  - **The fix (MAF output):** each chunk is folded in as it arrives. A
+    species keeps packed arrays (start/size/block: 16 B per contributing
+    chunk) only while it is single-scaffold and single-strand, and drops them
+    as soon as it is multi-scaffold or multi-strand, because those classes use
+    no gaps. The final computation is the old one unchanged: class
+    precedence, stable sort by start, boundary attribution and tie-breaking.
+    `summarizeElementLoci` is now a wrapper over it.
+  - **Arrays only from the second chunk:** a species' first chunk is kept in
+    plain fields. Creating three arrays per species up front made the summary
+    8% slower than v0.8.1 on small elements (22.5 vs 20.8 µs for a 15-species
+    element). Lazily it is 18% faster (17.6 vs 21.4 µs), because most species
+    in a small element have one chunk.
+  - **FASTA output is unchanged:** it keeps every chunk dict anyway (headers,
+    `--loci-table`), so it still collects references and calls
+    `summarizeElementLoci` once at the end, exactly as before.
+  - **Equivalence:** `tests/test_loci_accumulator.py` checks it against a
+    verbatim copy of v0.8.1's code on 12,000 random elements (ties,
+    out-of-order and overlapping chunks, zero sizes, multi
+    scaffold/strand, repeated or missing `block_index`).
+  - **Measured on the hamster slice, MAF mode,** worker peak RSS: 93 Mb region
+    1,531 -> 94 MB (and 64.6 -> 56.1s); 30 Mb 420 -> 56 MB; 10 Mb 113 -> 44
+    MB. Outputs, summary included, are byte-identical to v0.8.1. FASTA mode
+    must hold every species' sequence for the region, so a huge region stays
+    large: 93 Mb was 6,719 MB for v0.8.1 and 6,735 MB for the fix.
+  - **Measuring pitfall:** forkserver workers (Python 3.14) are invisible to
+    `/usr/bin/time`. Use Python 3.12 (fork), or sample `/proc/<pid>/status`
+    VmHWM across the process tree. Also compare both versions run from copies
+    outside the project directory. Run from the project directory, the same
+    code peaked ~350 MB (5%) higher on the 93 Mb FASTA region: pymalloc
+    fragmentation at a 6.7 GB peak shifts with trivial import-time
+    differences. With `PYTHONMALLOC=malloc` both versions measured
+    7,046-7,050 MB.
+  - **Full hamster BED** (979,442 regions, `-p 8`), v0.8.1 vs fix: all
+    979,444 output files byte-identical in MAF and FASTA mode.
+    - MAF mode: 94.7s vs 94.2s.
+    - FASTA mode: 119.6s vs 120.4s over six pairs, three in each run order.
+      Per-pair differences ran -3.8s to +4.7s against a node load of 9-20,
+      i.e. noise.
+  - **Not changed:** `block_stats`, one small list per block, about 44 MB at
+    93 Mb.
 - **Verified on real data** (1.5GB hamster slice, 258,186 blocks): all 1,752
   species/scaffold rows -- `src_size`, `blocks`, `aligned_bases` -- equal an
   independent awk tally exactly, and every pre-existing output (`block.tsv`,

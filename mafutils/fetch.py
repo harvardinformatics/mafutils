@@ -77,6 +77,7 @@ from enum import Enum
 from types import SimpleNamespace
 from typing import Annotated, Optional
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from array import array
 from collections import defaultdict, OrderedDict
 
 import typer
@@ -992,10 +993,11 @@ ELEMENT_LOCI_HEADERS = [
 ]
 
 
-def summarizeElementLoci(per_species_chunks):
+class ElementLociAccumulator:
     """
     Per-ELEMENT summary of how each species' contribution looks, as the values
-    for ELEMENT_LOCI_HEADERS.
+    for ELEMENT_LOCI_HEADERS -- built up one chunk at a time with add().
+
 
     Classification is irreducibly per-species -- one real element was
     contiguous for 5 species, split for 6 and empty for 3 -- so this reports
@@ -1022,47 +1024,156 @@ def summarizeElementLoci(per_species_chunks):
     cases) has a gap spanning more than one boundary; it is attributed to the
     first boundary it crosses, and the per-chunk loci table carries
     block_index/gap_to_next so that case stays inspectable.
+
+    Memory. This used to keep every chunk of the region as a dict until the
+    region ended, ~450 B per s line: linear in region size, so a 69 Mb region of
+    a 45-way MAF (40.5M s lines) was OOM-killed at 6 GB. Now a species keeps
+    only packed arrays (16 B per contributing chunk, created at its second
+    chunk), and drops them the moment it becomes multi-scaffold or
+    multi-strand, because those classes use no gaps (chunkGaps returns []). The values are exactly what the dict version
+    computed -- same class precedence, same stable sort by start, same boundary
+    attribution and tie-breaking -- which tests/test_loci_accumulator.py checks
+    against a verbatim copy of it.
     """
-    counts = {"single": 0, "contiguous": 0, "split": 0,
-              "multi_scaffold": 0, "multi_strand": 0, "no_bases": 0}
-    all_gaps = []
-    per_species_total = []
-    # boundary -> {species: gap}, keyed by the block ordinal the gap starts at
-    by_boundary = defaultdict(dict)
 
-    for species, chunks in per_species_chunks.items():
-        locus_class, _max_gap = classifyChunks(chunks)
-        if locus_class in counts:
-            counts[locus_class] += 1
+    # A chunk with no block_index: its boundary falls back to i + 1, as before.
+    NO_BLOCK_INDEX = -1
 
-        gaps = chunkGaps(chunks)
-        nonzero = [g for g in gaps if g != 0]
-        if nonzero:
+    def __init__(self):
+        # species -> [n_chunks, n_contributing, scaffold, strand,
+        #             multi_scaffold, multi_strand, starts, sizes, blocks,
+        #             first_start, first_size, first_block]
+        # in first-appearance order. A species' first contributing chunk is
+        # kept in the last three fields; the arrays are created only when a
+        # second one arrives (most species in a small element have one chunk,
+        # so they never allocate any), and are dropped again once the species
+        # is multi-scaffold or multi-strand.
+        self.species = {}
+
+    def addSpecies(self, species):
+        rec = self.species.get(species)
+        if rec is None:
+            rec = self.species[species] = [0, 0, None, None, False, False, None, None, None, 0, 0, 0]
+        return rec
+
+    def add(self, species, scaffold, strand, start, size, block_index):
+        """One chunk. Zero-size chunks only register the species (n.species)."""
+        rec = self.species.get(species)
+        if rec is None:
+            rec = self.addSpecies(species)
+        rec[0] += 1
+        if size <= 0:
+            return
+        if block_index is None:
+            block_index = self.NO_BLOCK_INDEX
+        n_contrib = rec[1]
+        rec[1] = n_contrib + 1
+        if n_contrib == 0:
+            rec[2] = scaffold
+            rec[3] = strand
+            rec[9] = start
+            rec[10] = size
+            rec[11] = block_index
+            return
+        if rec[4]:
+            return                              # multi_scaffold: final
+        if scaffold != rec[2]:
+            rec[4] = True                       # outranks multi_strand
+            rec[6] = rec[7] = rec[8] = None
+            return
+        if rec[5]:
+            return                              # multi_strand, one scaffold so far
+        if strand != rec[3]:
+            rec[5] = True
+            rec[6] = rec[7] = rec[8] = None
+            return
+        starts = rec[6]
+        if starts is None:                      # second chunk: start the arrays
+            starts = rec[6] = array('q', (rec[9],))
+            rec[7] = array('i', (rec[10],))
+            rec[8] = array('i', (rec[11],))
+        starts.append(start)
+        rec[7].append(size)
+        rec[8].append(block_index)
+
+    def summary(self):
+        counts = {"single": 0, "contiguous": 0, "split": 0,
+                  "multi_scaffold": 0, "multi_strand": 0, "no_bases": 0}
+        all_gaps = []
+        per_species_total = []
+        # boundary -> {species: gap}, keyed by the block ordinal the gap starts at
+        by_boundary = defaultdict(dict)
+
+        for species, rec in self.species.items():
+            n_chunks, n_contrib, _scaffold, _strand, multi_scaffold, multi_strand, starts, sizes, blocks = rec[:9]
+            if n_chunks == 0:
+                continue                        # registered with no chunks: no class
+            if n_contrib == 0:
+                counts["no_bases"] += 1
+                continue
+            if n_contrib == 1:
+                counts["single"] += 1
+                continue
+            if multi_scaffold:
+                counts["multi_scaffold"] += 1
+                continue
+            if multi_strand:
+                counts["multi_strand"] += 1
+                continue
+
+            # sorted() is stable, so equal starts keep insertion order, as
+            # sorting the chunk dicts by start did.
+            order = sorted(range(n_contrib), key=starts.__getitem__)
+            gaps = [
+                starts[order[i + 1]] - (starts[order[i]] + sizes[order[i]])
+                for i in range(n_contrib - 1)
+            ]
+            nonzero = [g for g in gaps if g != 0]
+            if not nonzero:
+                counts["contiguous"] += 1
+                continue
+            counts["split"] += 1
             all_gaps.extend(nonzero)
             per_species_total.append(sum(nonzero))
-            contributing = sorted((c for c in chunks if c['size'] > 0), key=lambda c: c['start'])
             for i, gap in enumerate(gaps):
                 if gap != 0:
-                    by_boundary[contributing[i].get('block_index', i + 1)][species] = gap
+                    block = blocks[order[i]]
+                    by_boundary[block if block != self.NO_BLOCK_INDEX else i + 1][species] = gap
 
-    if by_boundary:
-        busiest = max(by_boundary.values(), key=len)
-        boundary_n = len(busiest)
-        spread = max(busiest.values()) - min(busiest.values())
-    else:
-        boundary_n = 0
-        spread = 0
+        if by_boundary:
+            busiest = max(by_boundary.values(), key=len)
+            boundary_n = len(busiest)
+            spread = max(busiest.values()) - min(busiest.values())
+        else:
+            boundary_n = 0
+            spread = 0
 
-    return [
-        len(per_species_chunks),
-        counts["single"], counts["contiguous"], counts["split"],
-        counts["multi_scaffold"], counts["multi_strand"], counts["no_bases"],
-        max(per_species_total) if per_species_total else 0,
-        int(statistics.median(all_gaps)) if all_gaps else 0,
-        len(by_boundary),
-        boundary_n,
-        spread,
-    ]
+        return [
+            len(self.species),
+            counts["single"], counts["contiguous"], counts["split"],
+            counts["multi_scaffold"], counts["multi_strand"], counts["no_bases"],
+            max(per_species_total) if per_species_total else 0,
+            int(statistics.median(all_gaps)) if all_gaps else 0,
+            len(by_boundary),
+            boundary_n,
+            spread,
+        ]
+
+
+def summarizeElementLoci(per_species_chunks):
+    """
+    ElementLociAccumulator over {species: [chunk dict, ...]}. Every key counts
+    toward n.species, even with an empty list.
+    """
+    acc = ElementLociAccumulator()
+    for species, chunks in per_species_chunks.items():
+        acc.addSpecies(species)
+        for c in chunks:
+            if c['size'] > 0:
+                acc.add(species, c['scaffold'], c['strand'], c['start'], c['size'], c.get('block_index'))
+            else:
+                acc.add(species, None, None, None, c['size'], None)
+    return acc.summary()
 
 
 def fastaScaffoldField(chunks):
@@ -1399,8 +1510,13 @@ def fetchByRegion(
 
     block_lengths = []  # Holds lengths of each block written
     block_stats = []  # Holds [new_ref_start, new_ref_end, new_ref_size] for each block
-    # species -> [chunk, ...] for this element, feeding summarizeElementLoci.
-    element_chunks = defaultdict(list)
+    # Per-element locus summary. MAF output streams: each chunk is folded in as
+    # it arrives, so memory does not grow with the region (see
+    # ElementLociAccumulator). FASTA output must keep every chunk dict anyway
+    # (headers, --loci-table), so it only collects references to them and
+    # summarizes once at the end, as before -- streaming would save nothing.
+    element_loci = None if as_fasta else ElementLociAccumulator()
+    element_chunks = defaultdict(list) if as_fasta else None
     block_ordinal = 0
     total_ref_bases = 0 # Total ref bases across all blocks
 
@@ -1480,11 +1596,12 @@ def fetchByRegion(
         # while the FASTA path counts only the kept one.
         block_ordinal += 1
         if not as_fasta:
-            # Mutated in place rather than copied: trimMafBlock built these
-            # dicts fresh for this block and nothing else reads them.
+            # trimMafBlock built these dicts for this block only; nothing keeps
+            # them, so they are freed with the block.
+            add_chunk = element_loci.add
             for chunk in block_chunks:
-                chunk['block_index'] = block_ordinal
-                element_chunks[chunk.pop('species')].append(chunk)
+                add_chunk(chunk['species'], chunk['scaffold'], chunk['strand'],
+                          chunk['start'], chunk['size'], block_ordinal)
 
         if not single_output and trimmed is not None:
             block_stats.append(trimmed_info)
@@ -1637,7 +1754,8 @@ def fetchByRegion(
             profile_state["regions"] += 1
             addProfile(profile_state, "time_index_scan", time.perf_counter() - scan_timer_start)
             addProfile(profile_state, "time_region_total", time.perf_counter() - region_timer_start)
-        element_cols = "\t".join(str(v) for v in summarizeElementLoci(element_chunks))
+        element_values = summarizeElementLoci(element_chunks) if as_fasta else element_loci.summary()
+        element_cols = "\t".join(str(v) for v in element_values)
         summary = (f"{region_str}\t{num_blocks}\t{blocks_length}\t{len(species_order) if as_fasta else 'NA'}\t{element_cols}")
         return summary
 
