@@ -9,6 +9,7 @@ import hashlib
 import logging
 import os
 import shutil
+import sys
 import tempfile
 from typing import Annotated, Optional
 
@@ -19,23 +20,25 @@ from mafutils.lib import loginit as LOGINIT
 from mafutils.lib import options as OPTIONS
 
 
-def process_maf_block(block):
+def process_maf_block(ref_line, num_seqs):
     """
-    Returns (row, ref_len, aln_cols, num_seqs) for one block: the index row as
-    strings, plus the three integers the header aggregates need.
+    Returns (row, ref_len, aln_cols) for one block, from its reference 's'
+    line and its count of 's' lines (both from iterMafBlocks): the index row
+    as strings, plus the two integers the header aggregates need.
 
     The integers are returned rather than re-parsed from `row` on purpose --
     this loop runs once per block (233M times on a whole-genome MAF) and is the
     hot path the v0.6.0 indexing speedup optimised, so int()-ing its own output
     back again would be a needless per-block cost.
     """
-    ref_seq = block[1].split()
+    ref_seq = ref_line.split()
     ref_scaff = ref_seq[1].split(".", 1)[1]
-    line_len = str(len(block[1]))
-    num_seqs = len(block) - 1          # every s line, including the reference
+    line_len = str(len(ref_line))
     seq_len = len(ref_seq[6])          # block width, gap columns included
+    # num_seqs: 's' lines only, the reference included. i/e/q lines are not
+    # sequences (index format 3; see COMMON.INDEX_FORMAT).
     row = [ref_scaff, ref_seq[2], ref_seq[3], str(seq_len), line_len, str(num_seqs)]
-    return row, int(ref_seq[3]), seq_len, num_seqs
+    return row, int(ref_seq[3]), seq_len
 
 
 def run_index(maf_file, block_index_path, scaffold_index_path, LOG, progress_interval=COMMON.PROGRESS_INTERVAL_SECONDS):
@@ -82,8 +85,8 @@ def run_index(maf_file, block_index_path, scaffold_index_path, LOG, progress_int
             max_seqs = 0
             distinct_scaffolds = set()
 
-            for block, block_start, block_end in COMMON.iterMafBlocks(maf_stream, binary=use_binary):
-                block_info, ref_len, aln_cols, num_seqs = process_maf_block(block)
+            for (ref_line, num_seqs), block_start, block_end in COMMON.iterMafBlocks(maf_stream, binary=use_binary):
+                block_info, ref_len, aln_cols = process_maf_block(ref_line, num_seqs)
                 ref_scaffold = block_info[0]
 
                 n_blocks += 1
@@ -163,4 +166,11 @@ def index_command(
         log_verbosity="SCREEN",
         logger_name="maf_index_logger",
     )
-    run_index(maf_file, block_index, scaffold_index, logging.getLogger(logger_name), progress_interval=progress_interval)
+    LOG = logging.getLogger(logger_name)
+    try:
+        run_index(maf_file, block_index, scaffold_index, LOG, progress_interval=progress_interval)
+    except COMMON.MafFormatError as e:
+        # Raised mid-scan, before run_index writes the final index files, so
+        # nothing is left behind for a MAF that failed.
+        LOG.error(f"Cannot index {maf_file}: {e}. No index was written.")
+        sys.exit(1)

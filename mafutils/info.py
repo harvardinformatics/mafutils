@@ -21,6 +21,10 @@ scanned for these numbers:
      recommends rebuilding, so a long wait is never a surprise.
   3. No index: report only what needs no index and point at `mafutils index`.
 
+An index older than format 3 (see COMMON.INDEX_FORMAT) may have counted i/e/q
+lines as sequences, so its `seq lines` / `max seqs/block` are shown as
+unavailable and info exits 1 after printing everything else.
+
 Species are SAMPLED from the first N blocks (default 1000) and always labelled
 as such: species names are not recorded in the index, and collecting them
 during indexing would parse every non-reference `s` line, measured at 2.06x
@@ -144,6 +148,7 @@ def run_info(args, LOG):
 
     header = COMMON.readIndexHeader(index_file) if have_index else None
     aggregates = readAggregates(header)
+    seq_counts_exact = not have_index or COMMON.seqCountsExact(header)
 
     if have_index and aggregates is None:
         index_size = os.path.getsize(index_file)
@@ -201,8 +206,14 @@ def run_info(args, LOG):
         out.append(f"{'blocks':<15}: {aggregates['blocks']:,}")
         out.append(f"{'ref bases':<15}: {aggregates['ref_bases']:,}")
         out.append(f"{'aln columns':<15}: {aggregates['aln_cols']:,}")
-        out.append(f"{'seq lines':<15}: {aggregates['seq_lines']:,}   (all species, including the reference)")
-        out.append(f"{'max seqs/block':<15}: {aggregates['max_seqs']:,}")
+        if seq_counts_exact:
+            out.append(f"{'seq lines':<15}: {aggregates['seq_lines']:,}   (all species, including the reference)")
+            out.append(f"{'max seqs/block':<15}: {aggregates['max_seqs']:,}")
+        else:
+            old_index = f"index format {COMMON.indexFormat(header)}" if header else "a headerless index"
+            unavailable = f"unavailable ({old_index} may count i/e/q lines)"
+            out.append(f"{'seq lines':<15}: {unavailable}")
+            out.append(f"{'max seqs/block':<15}: {unavailable}")
     else:
         out.append(f"{'blocks':<15}: unavailable without an index -- run `mafutils index` first")
 
@@ -226,6 +237,11 @@ def run_info(args, LOG):
         out.append("For exact per-species presence across the whole file, run `mafutils stats`.")
 
     print("\n".join(out))
+
+    if not seq_counts_exact:
+        sys.stdout.flush()      # the report first, then the error under it
+        LOG.error(COMMON.oldIndexSeqCountMessage(index_file, args.maf_file, header))
+        sys.exit(1)
 
 
 #############################################################################

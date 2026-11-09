@@ -81,12 +81,13 @@ def test_validate_still_verifies_with_aggregates(tmp_path):
     assert "VERIFIED" in (r.stdout + r.stderr)
 
 
-def test_format_version_unchanged(tmp_path):
-    """Additive keys only -- bumping the format would imply an incompatibility
-    that does not exist, and old readers already ignore unknown keys."""
+def test_format_version_is_current(tmp_path):
+    """The aggregate keys are additive and did not bump the format (old readers
+    ignore unknown keys). Format 3 is the change in what the per-block
+    sequence count means: 's' lines only, no longer i/e/q lines too."""
     maf = build_index(tmp_path)
     header = COMMON.readIndexHeader(COMMON.deriveBlockIndexPath(maf))
-    assert header["format"] == "2"
+    assert header["format"] == "3"
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-# mafutils-index format=2 maf=loci-classes.maf compression=none size=29422 mtime=1789746613.0 hash=md5:e2a9c32b01c9e0b4f798534f8815d6a2
+# mafutils-index format=3 maf=loci-classes.maf compression=none size=29422 mtime=1789746613.0 hash=md5:e2a9c32b01c9e0b4f798534f8815d6a2
 CM000994.3	3541841	56	59	108	14	16	1666
 CM000994.3	3541897	163	179	229	14	1666	5017
 CM000994.3	3602158	290	311	361	15	5017	10577

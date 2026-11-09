@@ -1492,6 +1492,14 @@ def run_stats(args, cmdline="mafutils stats"):
     LOG.info(f"Reading index file: {index_file}")
     index_header = COMMON.readIndexHeader(index_file)
     COMMON.validateIndexHeader(index_header, args.maf_file, maf_compression, LOG, strict=args.verify_hash)
+    # block.tsv's n_seq_lines_index column is the index's per-block count, the
+    # only stats output that uses it (the dashboard and overall.tsv do not).
+    if not args.no_block_table and not COMMON.seqCountsExact(index_header):
+        LOG.error(
+            f"{COMMON.oldIndexSeqCountMessage(index_file, args.maf_file, index_header)} "
+            f"block.tsv reports these counts (n_seq_lines_index); --no-block-table runs without them."
+        )
+        sys.exit(1)
 
     header_blocks = COMMON.headerBlockCount(index_header, LOG, progress=args.progress_interval > 0)
     LOG.info(COMMON.progressStartupLine(args.progress_interval))
