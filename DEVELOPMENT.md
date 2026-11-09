@@ -35,9 +35,10 @@ for user-facing installation/usage docs.
   from one line instead of rescanning. Two constraints:
   `validate` compares the block and scaffold headers with **exact equality**
   (`validate.py`), so block-only keys would make every future validate report
-  MISMATCH -- the same dict goes into both. And the format stays at **2**:
-  the change is purely additive, `readIndexHeader` already parses arbitrary
-  keys, and `tests/test_validate.py` asserts `format == "2"`.
+  MISMATCH -- the same dict goes into both. The keys did not change the format
+  (it stayed at 2): they are purely additive, and `readIndexHeader` already
+  parses arbitrary keys. Format 3 came later, for a change in what the
+  sequence count *means* (see "count only `s` lines" below).
   `process_maf_block` returns the integers alongside its stringified row so the
   loop never int()s its own output back again; measured cost of the whole
   change on a 1.5GB slice, 3 runs each: **4.71s -> 4.77s (~1.3%)**, and a full
@@ -51,6 +52,58 @@ for user-facing installation/usage docs.
   index time costs 2.06x (0.79s -> 1.62s per 1.5GB), which would undo most of
   the v0.6.0 speedup. Verified end to end: 1.3s on the 42.7GB file, and the
   fallback's scanned values equal the header's exactly.
+- **The index's per-block sequence count is `s` lines only (index format
+  3).**
+  - **The bug:** since the first commit, `iterMafBlocks` kept every line that
+    was not `a`, `#` or blank, and `num_seqs` was `len(block) - 1`. That
+    counted `i`, `e` and `q` lines as sequences in block.idx column 6 and in
+    the `seq_lines`/`max_seqs` totals. Cactus MAFs have none of these lines,
+    so this went unnoticed. On a 45-way UCSC-style multiz MAF (84 GB, 8.4M
+    blocks), v0.8.1 reported `seq_lines=633,354,590 max_seqs=89`; the true
+    values are 270,212,333 and 45. 7.9M blocks claimed more than 45 sequences.
+    phyloacc-workflows chunks on this column, so its chunks were far emptier
+    than intended.
+  - **The fix:** `iterMafBlocks` tests for `s` first and only counts the
+    non-reference ones, yielding `(ref_line, n_seq_lines)`. `i`/`e`/`q` lines
+    are skipped by one tuple `startswith`. Any other line type, an `s` line
+    before the first `a`, or a block with no `s` line raises `MafFormatError`.
+    `index` reports it as one error and writes no index (the final files are
+    only written after the scan).
+  - **Why the format changed:** the column's *meaning* changed, which no
+    reader can detect from the values. `stats` (when it writes `block.tsv`,
+    whose `n_seq_lines_index` is this count) and `info` refuse a format-2 or
+    headerless index. `validate` reports it without changing its verdict.
+    `fetch` and `gc` never read the count, so they accept old indexes. This
+    avoids forcing a rebuild of, e.g., a 7.4 TB MAF's index just to fetch
+    from it.
+  - **Faster:** the old loop paid a `startswith('#')`, a `strip()` that copied
+    the whole line, a `startswith('a')` and a list append for every sequence
+    line. Now an `s` line costs one `startswith` and an increment.
+    `mafutils index`, v0.8.1 vs new (single process, `/usr/bin/time`, pairs
+    with the run order alternated):
+
+    | Input | v0.8.1 | New | Change |
+    |---|---|---|---|
+    | multiz 84 GB, uncompressed, 3 pairs | 323.4s | 289.8s | -10% |
+    | hamster 42.7 GB, uncompressed, 2 pairs | 123.9s | 110.9s | -10% |
+    | hamster gz, 1 pair | 184.3s | 169.8s | -8% |
+    | hamster bgzip, 1 pair | 226.1s | 215.2s | -5% |
+    | 1.5 GB slice gz, 3 pairs | 7.1s | 6.5s | -8% |
+    | 1.5 GB slice bgzip, 3 pairs | 8.4s | 7.8s | -7% |
+
+    The ranges of the two versions never overlapped. Peak RSS stayed at
+    31-46 MB.
+  - **Same output otherwise:**
+    - hamster (none/gz/bgzip) and the slices: block and scaffold index bodies
+      are byte-identical to v0.8.1, and the headers differ only in `format=3`;
+    - multiz: every column but 6 and the scaffold index are identical, and
+      column 6 equals an independent `awk` count of `s` lines for all
+      8,436,088 blocks.
+  - **Tests:** `tests/test_index_seq_lines.py`, on
+    `tests/multiz45way-excerpt.maf` (14 real blocks with 72 `s`, 58 `i` and
+    12 `e` lines). The committed test indexes were regenerated, their bodies
+    confirmed identical (those MAFs have only `s` lines), and their headers
+    changed to `format=3`.
 - **Per-species source scaffolds live in `stats`, not `index` or `info`.**
   Scaffold names and `srcSize` are only on non-reference `s` lines: parsing
   them in `index` measured 2.06x slower indexing, and sampling them in `info`
@@ -155,6 +208,53 @@ for user-facing installation/usage docs.
     opened "w".
   On 979,442 regions the check takes 0.2-0.7s and 27-50MB transient.
   `--single-output` skips the name checks, since it writes no per-region files.
+- **The per-element locus summary no longer grows with region size**
+  (`ElementLociAccumulator`).
+  - **The problem:** from v0.6.0, `fetchByRegion` kept one chunk dict per `s`
+    line of the region (`element_chunks`) just to compute the 12 summary
+    columns at the end. That is ~450 B per line, so a 69 Mb region of a
+    45-way bird MAF (40.5M `s` lines) was OOM-killed at 6 GB, where v0.5.0
+    used 307 MB.
+  - **The fix (MAF output):** each chunk is folded in as it arrives. A
+    species keeps packed arrays (start/size/block: 16 B per contributing
+    chunk) only while it is single-scaffold and single-strand, and drops them
+    as soon as it is multi-scaffold or multi-strand, because those classes use
+    no gaps. The final computation is the old one unchanged: class
+    precedence, stable sort by start, boundary attribution and tie-breaking.
+    `summarizeElementLoci` is now a wrapper over it.
+  - **Arrays only from the second chunk:** a species' first chunk is kept in
+    plain fields. Creating three arrays per species up front made the summary
+    8% slower than v0.8.1 on small elements (22.5 vs 20.8 µs for a 15-species
+    element). Lazily it is 18% faster (17.6 vs 21.4 µs), because most species
+    in a small element have one chunk.
+  - **FASTA output is unchanged:** it keeps every chunk dict anyway (headers,
+    `--loci-table`), so it still collects references and calls
+    `summarizeElementLoci` once at the end, exactly as before.
+  - **Equivalence:** `tests/test_loci_accumulator.py` checks it against a
+    verbatim copy of v0.8.1's code on 12,000 random elements (ties,
+    out-of-order and overlapping chunks, zero sizes, multi
+    scaffold/strand, repeated or missing `block_index`).
+  - **Measured on the hamster slice, MAF mode,** worker peak RSS: 93 Mb region
+    1,531 -> 94 MB (and 64.6 -> 56.1s); 30 Mb 420 -> 56 MB; 10 Mb 113 -> 44
+    MB. Outputs, summary included, are byte-identical to v0.8.1. FASTA mode
+    must hold every species' sequence for the region, so a huge region stays
+    large: 93 Mb was 6,719 MB for v0.8.1 and 6,735 MB for the fix.
+  - **Measuring pitfall:** forkserver workers (Python 3.14) are invisible to
+    `/usr/bin/time`. Use Python 3.12 (fork), or sample `/proc/<pid>/status`
+    VmHWM across the process tree. Also compare both versions run from copies
+    outside the project directory. Run from the project directory, the same
+    code peaked ~350 MB (5%) higher on the 93 Mb FASTA region: pymalloc
+    fragmentation at a 6.7 GB peak shifts with trivial import-time
+    differences. With `PYTHONMALLOC=malloc` both versions measured
+    7,046-7,050 MB.
+  - **Full hamster BED** (979,442 regions, `-p 8`), v0.8.1 vs fix: all
+    979,444 output files byte-identical in MAF and FASTA mode.
+    - MAF mode: 94.7s vs 94.2s.
+    - FASTA mode: 119.6s vs 120.4s over six pairs, three in each run order.
+      Per-pair differences ran -3.8s to +4.7s against a node load of 9-20,
+      i.e. noise.
+  - **Not changed:** `block_stats`, one small list per block, about 44 MB at
+    93 Mb.
 - **Verified on real data** (1.5GB hamster slice, 258,186 blocks): all 1,752
   species/scaffold rows -- `src_size`, `blocks`, `aligned_bases` -- equal an
   independent awk tally exactly, and every pre-existing output (`block.tsv`,
@@ -183,15 +283,18 @@ for user-facing installation/usage docs.
   before assuming it's mafutils-specific. Keep this file otherwise
   unmodified so future diffs against upstream stay clean.
 - Index files (`.block.idx`/`.scaffold.idx`) carry a `# mafutils-index
-  format=2 maf=<name> compression=<mode> size=<bytes> mtime=<epoch>
+  format=3 maf=<name> compression=<mode> size=<bytes> mtime=<epoch>
   hash=<algo>:<hex>` header line (helpers in `mafutils/lib/common.py`:
   `writeIndexHeader`/`readIndexHeader`/`compareIndexHeader`/
-  `validateIndexHeader`). Existing parsers already skip `#` lines, so this
-  is backward compatible. Format-1 indexes (pre-dating size/mtime/hash)
-  simply lack those keys in the parsed header dict — every consumer treats
-  their absence as "can't check this dimension," not an error, same as a
-  fully missing header. Tests build a headerless index on the fly rather than
-  relying on a committed one (see above).
+  `validateIndexHeader`; format history at `INDEX_FORMAT`). Existing parsers
+  already skip `#` lines, so this is backward compatible. Format-1 indexes
+  (pre-dating size/mtime/hash) simply lack those keys in the parsed header
+  dict — every consumer treats their absence as "can't check this
+  dimension," not an error, same as a fully missing header. The exception is
+  the per-block sequence count, which formats 1-2 got wrong on MAFs with
+  `i`/`e`/`q` lines: `stats` (block table) and `info` refuse those indexes.
+  Tests build a headerless index on the fly rather than relying on a
+  committed one (see above).
 - **Computing the hash costs nothing extra at `mafutils index` time, for
   all three compression types** — this was the whole point of always
   storing it. `common._HashingRawIO` (an `io.RawIOBase` subclass) sits
@@ -296,7 +399,7 @@ for user-facing installation/usage docs.
   C-implemented `BufferedReader.readline()` while adding Python-level buffer
   slicing), and a block-level scanner that finds `b"\na"` boundaries to avoid
   per-line iteration entirely (2.71s — still has to walk every line to count
-  non-blank lines for `num_seqs`, plus buffer-concatenation cost). Remaining
+  the `s` lines for `num_seqs`, plus buffer-concatenation cost). Remaining
   headroom is real but modest: end-to-end sits at ~129 MB/s against a ~640 MB/s
   ceiling (raw read + MD5 with no parsing at all), and closing it would require
   assuming things about intra-block blank/comment lines that risk silently
@@ -598,6 +701,55 @@ for user-facing installation/usage docs.
   (`prefetchBlockCache`/`WORKER_BLOCK_CACHE`), which sidesteps
   backward-seek risk entirely rather than relying on any per-region
   processing order.
+
+## Possible future work
+
+- **Duplicate checks in `stats`** (assessed 2026-11, not implemented).
+  "Duplicates" reported in `cactus-hal2maf --outType single` ("nodupes") MAFs
+  are expected, not a Cactus bug. That option guarantees at most one row per
+  genome per block, not that each non-reference base appears only once: where
+  the reference has several copies of a region, a single-copy segment of
+  another genome aligns at each of them. On a 27-genome hamster MAF this was
+  2.2-3.7% of each non-reference genome's aligned bases, and 0 for the
+  reference.
+  - *A genome in more than one row of a block* is already counted per
+    species (`duplicated_blocks` in `species.tsv`, `n_duplicate_copies` in
+    `block.tsv`). Still missing, and cheap:
+    - an overall count of affected blocks (summing the species counts
+      double-counts);
+    - the first few locations;
+    - a log line worded for both nodupes and full MAFs.
+  - *Duplicate bases per genome* = aligned bases minus distinct bases, using
+    forward-strand coordinates (`srcSize - start - size` for `-` rows) and
+    keyed by (genome, sequence); optionally a BED of the duplicated intervals.
+    It needs every row's interval:
+    - merge intervals within each worker chunk (keeps ~36% of rows on a
+      hamster slice), counting overlaps within the chunk before merging;
+    - write compact binary records to one temporary file per genome;
+    - sort each genome in memory.
+
+    Estimated at about 6 bytes of temporary disk per MAF row (~0.6 GB for the
+    42.7 GB hamster MAF), so it should be opt-in. Check a large MAF's row
+    count first (`seq lines` in `mafutils info`). Deferred mainly over that
+    temporary-disk cost on very large MAFs.
+- **`fetch` copies `i`/`e`/`q` lines through trimmed blocks unchanged**
+  (`trimMafBlock`, the `fields[0] != "s"` branch). In a block trimmed to a
+  region, a `q` line keeps its full-width quality string while its `s` line is
+  cut, so the two lengths no longer match. `i`-line base counts also go stale
+  at trimmed edges. `e` lines stay valid, and FASTA output never reads these
+  lines. Only MAFs that have them are affected: UCSC multiz MAFs, not cactus
+  ones. A fix would trim `q` lines with their `s` line and drop or recompute
+  `i` lines in trimmed blocks only, checked for byte-identity on whole blocks.
+- **`e`-line status could tell an indel from missing data.** `e` marks a
+  species with no aligned bases in a block but bridged across it. Its status
+  says why:
+  - C: the flanking sequence is contiguous, so the region was deleted in that
+    species or inserted in the reference;
+  - I: unaligned bases in between;
+  - M: those bases are mostly N, i.e. missing data.
+
+  `fetch` and `stats` treat all of these, and "not aligned at all", as the same
+  absence. This applies to UCSC MAFs only.
 
 ## Development setup
 

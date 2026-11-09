@@ -93,6 +93,14 @@ def run_validate(args, cmdline="mafutils validate"):
         )
         sys.exit(2)
 
+    # Reported, not part of the verdict: the verdict is whether the index
+    # matches this MAF, which an older format does not change. stats and info
+    # refuse it themselves where they would show its sequence counts.
+    if COMMON.seqCountsExact(header):
+        LOG.info(f"{'format':11}: {COMMON.indexFormat(header)}")
+    else:
+        LOG.warning(f"{'format':11}: {COMMON.oldIndexSeqCountMessage(index_file, args.maf_file, header)}")
+
     result = COMMON.compareIndexHeader(header, args.maf_file, detected_compression, check_hash=True)
 
     conclusive_mismatch = False

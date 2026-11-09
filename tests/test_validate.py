@@ -52,7 +52,7 @@ def combined_output(result):
 def test_index_header_has_size_mtime_hash():
     header = COMMON.readIndexHeader(INDEX_FILE)
     assert header is not None
-    assert header["format"] == "2"
+    assert header["format"] == "3"
     assert int(header["size"]) == os.path.getsize(MAF_FILE)
     assert header["hash"] == COMMON.computeFileHash(MAF_FILE)
 

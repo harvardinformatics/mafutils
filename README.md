@@ -143,6 +143,13 @@ check for this every run, at two tiers:
 For a "check once, trust thereafter" workflow instead of passing
 `--verify-hash` on every invocation, use `mafutils validate` (see below).
 
+**Older indexes.** An index whose header says `format=2` or lower, or that
+has no header, counted `i`/`e`/`q` lines as sequences. That inflates its
+per-block sequence count on MAFs that have such lines (UCSC multiz MAFs do;
+cactus MAFs don't). `fetch` and `gc` don't use the count and still accept
+these indexes. `stats` (unless `--no-block-table`) and `info` show it, so they
+ask you to rebuild with `mafutils index`, and `validate` flags it.
+
 ## Commands
 
 ### `mafutils index`
@@ -222,7 +229,7 @@ including each species' source scaffolds and their lengths.
 
 **Column meanings.** `ref scaffolds` and `ref bases` are measured on the
 *reference* sequence. `seq lines` counts every `s` line including the
-reference. `aln columns` is the block width, gap columns included, which all
+reference (`i`/`e`/`q` lines are not sequences). `aln columns` is the block width, gap columns included, which all
 species share.
 
 ### `mafutils fetch`

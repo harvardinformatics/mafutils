@@ -307,6 +307,20 @@ INDEX_HEADER_PREFIX = "# mafutils-index"
 # them simply lacks the keys and consumers fall back to scanning.
 INDEX_AGGREGATE_KEYS = ("blocks", "scaffolds", "ref_bases", "aln_cols", "seq_lines", "max_seqs")
 
+# Format history:
+#   1  no size/mtime/hash in the header
+#   2  size/mtime/hash (and, from v0.7.0, the aggregate keys -- additive, so
+#      they did not need a new format)
+#   3  the per-block sequence count (block.idx column 6) and the seq_lines /
+#      max_seqs totals count only 's' lines. Formats 1-2 also counted i/e/q
+#      lines, so on a MAF that has them (UCSC multiz MAFs do; cactus MAFs do
+#      not) those numbers are inflated -- up to ~2x on a 45-way multiz MAF.
+#      Block offsets and every other column are unchanged.
+INDEX_FORMAT = 3
+
+# The first format whose sequence counts are 's' lines only.
+SEQ_COUNT_INDEX_FORMAT = 3
+
 
 def writeIndexHeader(stream, maf_file, compression, size, mtime, content_hash, aggregates=None):
     """
@@ -319,10 +333,10 @@ def writeIndexHeader(stream, maf_file, compression, size, mtime, content_hash, a
     describe the MAF rather than the index file, so identical values in both is
     also the semantically right thing.
 
-    Kept at format=2 deliberately: extra key=value tokens are additive and
-    readIndexHeader already parses arbitrary keys, with every consumer treating
-    a missing key as "can't check this dimension". Bumping the format would
-    imply an incompatibility that does not exist.
+    Extra key=value tokens are additive (readIndexHeader parses arbitrary keys,
+    and every consumer treats a missing key as "can't check this dimension"),
+    so they do not change the format. A change in what an existing column
+    means does -- see INDEX_FORMAT.
     """
     extra = ""
     if aggregates:
@@ -330,8 +344,39 @@ def writeIndexHeader(stream, maf_file, compression, size, mtime, content_hash, a
             f" {key}={aggregates[key]}" for key in INDEX_AGGREGATE_KEYS if key in aggregates
         )
     stream.write(
-        f"{INDEX_HEADER_PREFIX} format=2 maf={os.path.basename(maf_file)} "
+        f"{INDEX_HEADER_PREFIX} format={INDEX_FORMAT} maf={os.path.basename(maf_file)} "
         f"compression={compression} size={size} mtime={mtime} hash={content_hash}{extra}\n"
+    )
+
+
+def indexFormat(header):
+    """The index's format number from a readIndexHeader dict; 0 for a missing header."""
+    if header is None:
+        return 0
+    value = header.get("format")
+    if value is None or not value.isdigit():
+        raise ValueError(f"index header has no valid format number: format={value}")
+    return int(value)
+
+
+def seqCountsExact(header):
+    """True when the index's sequence counts are 's' lines only (format 3+)."""
+    return indexFormat(header) >= SEQ_COUNT_INDEX_FORMAT
+
+
+def oldIndexSeqCountMessage(index_file, maf_file, header):
+    """
+    The one wording stats/info/validate use for an index whose sequence counts
+    predate format 3. Says "may": the counts are only wrong if the MAF has
+    i/e/q lines, which the index alone cannot tell.
+    """
+    built_by = (
+        "an older mafutils with no index header" if header is None
+        else f"an older mafutils (index format {indexFormat(header)})"
+    )
+    return (
+        f"{index_file} was built by {built_by}, whose per-block sequence counts "
+        f"may also include i/e/q lines. Rebuild it with `mafutils index {maf_file}`."
     )
 
 
@@ -498,23 +543,42 @@ def validateIndexHeader(header, maf_file, detected_compression, LOG, strict=Fals
 
 #############################################################################
 
+class MafFormatError(ValueError):
+    """A MAF line or block that mafutils cannot index correctly."""
+
+
+def _linePreview(line):
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", errors="replace")
+    line = line.rstrip("\r\n")
+    return repr(line[:60] + ("..." if len(line) > 60 else ""))
+
+
 def iterMafBlocks(stream, binary=False):
     """
-    Splits an open MAF stream into raw per-block lines, split on 'a'-prefixed
-    header lines (skipping blank/comment lines). Yields
-    (block_lines, block_start_offset, block_end_offset) tuples, where the
-    offsets bracket each block and are suitable for later random-access
-    seeking back into the same file.
+    Splits an open MAF stream into blocks at 'a' lines. Yields
+    ((ref_line, n_seq_lines), block_start_offset, block_end_offset), where
+    the offsets bracket each block (any comment/blank lines after it
+    included) for later random-access seeking back into the same file.
 
-    block_lines[0] (the 'a' header) and block_lines[1] (the reference/first
-    sequence line) are always returned as stripped `str` -- they are the
-    only two lines whose *content* mafutils index reads. The remaining
-    sequence lines are returned exactly as readline() produced them, and in
-    binary mode are still `bytes`: only their *count* (len(block_lines)) is
-    ever used downstream, so decoding/stripping them would be pure overhead.
-    That matters enormously at scale -- a block can carry hundreds of
-    sequence lines (one per species) and a whole-genome MAF hundreds of
-    millions of blocks.
+    ref_line is the block's first 's' line (the reference), stripped `str`:
+    the only line whose *content* mafutils index reads. n_seq_lines counts
+    the block's 's' lines, the reference included. The other 's' lines are
+    only counted -- never stored, decoded or stripped -- because a block can
+    carry hundreds of them and a whole-genome MAF has hundreds of millions
+    of blocks.
+
+    Line types, tested in order of frequency so the common 's' line costs a
+    single startswith():
+      s        counted (the first one in a block is the reference)
+      a        starts a new block
+      i, e, q  skipped: per-species context, empty-region and quality lines
+               describe a species' sequence but are not one. Counting them
+               (as mafutils did before index format 3) inflated the per-block
+               count -- on a UCSC 45-way multiz MAF, to 89 "sequences".
+      #, blank skipped
+    Anything else, an 's' line before the first 'a' line, or a block with no
+    's' line raises MafFormatError rather than being guessed at.
 
     Two position-tracking modes, because the two cases are fundamentally
     different:
@@ -540,14 +604,17 @@ def iterMafBlocks(stream, binary=False):
     why the binary counting path above must not be used for bgzip.
     """
     if binary:
-        empty, hash_prefix, a_prefix = b"", b"#", b"a"
+        empty, hash_prefix, a_prefix, s_prefix = b"", b"#", b"a", b"s"
+        skipped_prefixes = (b"i", b"e", b"q")
     else:
-        empty, hash_prefix, a_prefix = "", "#", "a"
+        empty, hash_prefix, a_prefix, s_prefix = "", "#", "a", "s"
+        skipped_prefixes = ("i", "e", "q")
 
-    block_lines = []
+    ref_line = None
+    n_seq_lines = 0
+    n_blocks = 0
     block_start = None
     pos = 0 if binary else stream.tell()
-    next_line_is_reference = False
 
     while True:
         line = stream.readline()
@@ -555,26 +622,38 @@ def iterMafBlocks(stream, binary=False):
             break
         next_pos = pos + len(line) if binary else stream.tell()
 
-        if line.startswith(hash_prefix) or not line.strip():
-            pos = next_pos
-            continue
-
-        if line.startswith(a_prefix):
-            if block_lines:
-                yield block_lines, block_start, pos
+        if line.startswith(s_prefix):
+            if n_seq_lines:
+                n_seq_lines += 1
+            else:
+                if block_start is None:
+                    raise MafFormatError(f"'s' line before the first 'a' line: {_linePreview(line)}")
+                ref_line = line.decode().strip() if binary else line.strip()
+                n_seq_lines = 1
+        elif line.startswith(a_prefix):
+            if block_start is not None:
+                if not n_seq_lines:
+                    raise MafFormatError(f"block {n_blocks:,} has no 's' line")
+                yield (ref_line, n_seq_lines), block_start, pos
+            n_blocks += 1
             block_start = pos
-            block_lines = [line.decode().strip() if binary else line.strip()]
-            next_line_is_reference = True
-        elif next_line_is_reference:
-            block_lines.append(line.decode().strip() if binary else line.strip())
-            next_line_is_reference = False
+            ref_line = None
+            n_seq_lines = 0
+        elif line.startswith(skipped_prefixes) or line.startswith(hash_prefix) or not line.strip():
+            pass
         else:
-            block_lines.append(line)
+            where = f"in block {n_blocks:,}" if n_blocks else "before the first block"
+            raise MafFormatError(
+                f"unrecognized line {where}: {_linePreview(line)} "
+                f"(expected a, s, i, e, q, # or blank lines)"
+            )
 
         pos = next_pos
 
-    if block_lines:
-        yield block_lines, block_start, pos if binary else stream.tell()
+    if block_start is not None:
+        if not n_seq_lines:
+            raise MafFormatError(f"block {n_blocks:,} has no 's' line")
+        yield (ref_line, n_seq_lines), block_start, pos if binary else stream.tell()
 
 #############################################################################
 
